@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Python cache
+__pycache__/
+
+# 환경변수 / API Key
+.env
+
+# 실습 PDF 원본
+data/*.pdf
