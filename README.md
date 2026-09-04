@@ -145,12 +145,64 @@ Embedding은 cosine similarity 비교를 위해 정규화했습니다.
 현재 문서와 `chunk_size=500`, `chunk_overlap=100` 기준에서는
 Embedding 과정에서 입력 길이 제한으로 잘리는 Chunk가 없음을 확인했습니다.
 
+## 4. FAISS 기반 Vector Search
+
+162개의 Chunk Vector에서 질문과 의미가 가까운 Chunk를 찾기 위해
+CPU 기반 FAISS의 `IndexFlatIP`를 사용했습니다.
+
+현재 검색 대상이 162개의 Chunk Vector로 작기 때문에,
+모든 Vector를 직접 비교하는 exact search 방식으로도 충분합니다.
+Embedding이 정규화되어 있어 Inner Product를 cosine similarity로 사용할 수 있으며,
+FAISS에는 `float32` 타입의 Vector를 등록했습니다.
+
+FAISS는 Chunk metadata를 직접 반환하지 않고 등록된 Vector의 index를 반환합니다.
+이 index로 기존 `chunks` 목록에 접근하여 `chunk_id`, `page_number`, `text`를 연결합니다.
+
+검증 질문과 검색 기준:
+
+- 질문: `생성형 AI가 만든 이미지의 저작권은 누구에게 있나요?`
+- `top_k = 5`
+- FAISS: `IndexFlatIP`
+- Chunk Vector: 162개
+- Embedding shape: `(162, 384)`
+- dtype: `float32`
+
+1위 검색 결과:
+
+- similarity: `0.9257`
+- FAISS index: `27`
+- `chunk_id`: `28`
+- `page_number`: `18`
+
+### NumPy 직접 계산 검증
+
+동일한 Query Vector와 Chunk Vector의 Inner Product를 NumPy로 직접 계산하고,
+FAISS의 Top-5 결과와 비교했습니다.
+
+- NumPy Top-5: `[27, 38, 2, 92, 34]`
+- FAISS Top-5: `[27, 38, 2, 92, 34]`
+- index 순서 동일: `True`
+- similarity 점수 동일: `True`
+
+동일한 similarity를 가진 Vector가 있으면 FAISS와 NumPy가 동점 Vector의
+순서를 다르게 반환할 수 있습니다. 따라서 index 순서의 완전 일치와
+similarity 점수의 일치를 별도로 검증합니다.
+
+### 실행 방법
+
+```bash
+uv run python -m rag_basic.vector_search
+```
+
+현재 FAISS index는 파일로 저장하지 않고 실행할 때마다 메모리에서 생성합니다.
+Retrieval과 LLM 연결은 아직 구현하지 않았습니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
 - [x] Chunking
 - [x] Embedding
-- [ ] FAISS 기반 Vector Search
+- [x] FAISS 기반 Vector Search
 - [ ] Retrieval
 - [ ] LLM 연결
 - [ ] RAG 품질 평가
