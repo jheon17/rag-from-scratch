@@ -195,7 +195,61 @@ uv run python -m rag_basic.vector_search
 ```
 
 현재 FAISS index는 파일로 저장하지 않고 실행할 때마다 메모리에서 생성합니다.
-Retrieval과 LLM 연결은 아직 구현하지 않았습니다.
+LLM 연결은 아직 구현하지 않았습니다.
+
+## 5. Retrieval
+
+Vector Search는 질문과 가까운 Vector의 score와 index를 찾는 단계이고,
+Retrieval은 이 결과를 원래 Chunk의 text와 metadata에 다시 연결하는 단계입니다.
+
+`src/rag_basic/retrieval.py`에서는 기존 `embedding.py`의 `embed_texts()`와
+`vector_search.py`의 `build_index()`를 재사용하며, `top_k = 5`로 검색합니다.
+FAISS가 반환한 index로 기존 `chunks` 목록을 조회하여 검색 결과를
+`list[dict]` 형태로 구성했습니다.
+
+각 결과에는 다음 정보가 포함됩니다.
+
+- `rank`
+- `score`
+- `faiss_index`
+- `chunk_id`
+- `page_number`
+- `text`
+
+FAISS와 NumPy가 반환한 score와 index는 이후 코드에서 쉽게 사용할 수 있도록
+일반 Python의 `float`와 `int`로 변환했습니다.
+
+### Context 구성
+
+`build_context()`는 검색된 각 Chunk의 전체 text를 하나의 문자열로 합칩니다.
+각 출처는 다음 header로 구분하여 원본 페이지와 Chunk를 추적할 수 있습니다.
+
+```text
+[Source N | page=... | chunk_id=...]
+```
+
+입력 list의 순서가 뒤섞여도 `rank`를 기준으로 정렬하여 Context의 Source 순서를
+보장합니다. 이렇게 만든 Context는 다음 단계에서 LLM에 참고 자료로 전달할 수 있지만,
+현재는 LLM 호출과 답변 생성을 구현하지 않았습니다.
+
+### 검증 결과
+
+- Retrieval 결과 개수: 5
+- 검색된 FAISS index: `[27, 38, 2, 92, 34]`
+- 이전 Vector Search 결과와 동일: `True`
+- 생성된 Context 전체 글자 수: 2305
+- Retrieval 결과가 정확히 5개인가: `True`
+- rank가 1~5 순서인가: `True`
+- 모든 결과에 필요한 key가 존재하는가: `True`
+- Context에 모든 Chunk text가 포함되는가: `True`
+- Context의 Source 순서가 rank와 동일한가: `True`
+- 역순 입력에서도 Source 1~5 순서로 재정렬되는가: `True`
+
+### 실행 방법
+
+```bash
+uv run python -m rag_basic.retrieval
+```
 
 ## 진행 상황
 
@@ -203,7 +257,7 @@ Retrieval과 LLM 연결은 아직 구현하지 않았습니다.
 - [x] Chunking
 - [x] Embedding
 - [x] FAISS 기반 Vector Search
-- [ ] Retrieval
+- [x] Retrieval
 - [ ] LLM 연결
 - [ ] RAG 품질 평가
 
