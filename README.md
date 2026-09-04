@@ -195,7 +195,6 @@ uv run python -m rag_basic.vector_search
 ```
 
 현재 FAISS index는 파일로 저장하지 않고 실행할 때마다 메모리에서 생성합니다.
-LLM 연결은 아직 구현하지 않았습니다.
 
 ## 5. Retrieval
 
@@ -229,8 +228,7 @@ FAISS와 NumPy가 반환한 score와 index는 이후 코드에서 쉽게 사용�
 ```
 
 입력 list의 순서가 뒤섞여도 `rank`를 기준으로 정렬하여 Context의 Source 순서를
-보장합니다. 이렇게 만든 Context는 다음 단계에서 LLM에 참고 자료로 전달할 수 있지만,
-현재는 LLM 호출과 답변 생성을 구현하지 않았습니다.
+보장합니다. 이렇게 만든 Context는 LLM 연결 단계에서 참고 자료로 전달합니다.
 
 ### 검증 결과
 
@@ -251,6 +249,74 @@ FAISS와 NumPy가 반환한 score와 index는 이후 코드에서 쉽게 사용�
 uv run python -m rag_basic.retrieval
 ```
 
+## 6. LLM 연결
+
+일반 LLM 호출은 모델이 학습한 일반 지식을 바탕으로 답하지만,
+RAG의 LLM 호출은 Retrieval에서 찾은 Context와 질문을 함께 전달하여
+검색된 문서를 근거로 답하도록 합니다.
+
+`src/rag_basic/llm.py`에서는 OpenAI Python SDK의 Responses API와
+`gpt-5.6-luna` 모델을 사용했습니다. 기존 단계의 다음 함수를 재사용합니다.
+
+- `embedding.py`의 `embed_texts()`
+- `vector_search.py`의 `build_index()`
+- `retrieval.py`의 `retrieve()`
+- `retrieval.py`의 `build_context()`
+
+`generate_answer()`는 Retrieval이나 FAISS 검색을 직접 수행하지 않고,
+질문과 Retrieval에서 생성된 Context를 받아 답변을 생성하는 Generation 역할만 담당합니다.
+
+### 답변 규칙
+
+LLM에는 다음 규칙을 전달합니다.
+
+- 제공된 Context만 근거로 답변
+- Context에 없는 내용을 일반 지식으로 보충하거나 추측하지 않음
+- 근거가 부족하면 `제공된 문서에서 확인할 수 없습니다.`라고 답변
+- 사용한 근거를 `[Source N]` 형태로 표시
+- 간결한 한국어로 답변
+
+Source 번호를 답변에 포함하여 어떤 검색 결과를 근거로 사용했는지 추적할 수 있습니다.
+
+### 정상 질문 검증
+
+질문: `생성형 AI가 만든 이미지의 저작권은 누구에게 있나요?`
+
+- Retrieval FAISS index: `[27, 38, 2, 92, 34]`
+- Context 글자 수: 2305
+- 문서의 저작권 관련 내용을 근거로 답변 생성
+- 답변에 `[Source 1] [Source 2] [Source 5]` 포함
+
+### 문서 밖 질문 검증
+
+질문: `프랑스의 수도는 어디인가요?`
+
+- Retrieval FAISS index: `[135, 101, 64, 107, 95]`
+- Context 글자 수: 2501
+- 최종 답변: `제공된 문서에서 확인할 수 없습니다.`
+
+문서 밖 질문에도 모델의 일반 지식으로 답하지 않는지 확인하여 grounding 동작을
+검증했습니다.
+
+검증 결과:
+
+- 정상 질문의 답변이 비어 있지 않은가: `True`
+- 정상 질문의 답변에 `[Source`가 포함되는가: `True`
+- 문서 밖 질문의 답변이 지정된 문장과 정확히 일치하는가: `True`
+
+### API Key 설정 및 실행 방법
+
+API Key는 코드에 저장하지 않고 `OPENAI_API_KEY` 환경변수로 전달합니다.
+실제 Key를 Git이나 README에 기록하지 않습니다.
+
+```bash
+export OPENAI_API_KEY="발급받은_API_KEY"
+uv run python -m rag_basic.llm
+```
+
+현재 구현은 RAG의 전체 흐름을 연결한 첫 baseline이며,
+검색과 답변의 품질을 체계적으로 측정하는 RAG 품질 평가는 아직 구현하지 않았습니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -258,7 +324,7 @@ uv run python -m rag_basic.retrieval
 - [x] Embedding
 - [x] FAISS 기반 Vector Search
 - [x] Retrieval
-- [ ] LLM 연결
+- [x] LLM 연결
 - [ ] RAG 품질 평가
 
 ## AI 도구 활용
