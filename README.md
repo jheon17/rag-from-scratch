@@ -93,11 +93,63 @@ Python 문자열 슬라이싱을 이용해 Chunking의 기본 원리를 확인�
 첫 구현에서는 이를 임의로 제거하지 않고 기본 방식의 한계로 기록했으며,
 향후 검색 결과를 확인하면서 Chunking 및 전처리 방법을 개선할 예정입니다.
 
+## 3. Embedding
+
+Chunking한 문서를 의미 기반으로 비교할 수 있도록
+`intfloat/multilingual-e5-small` 모델을 사용해 Vector로 변환했습니다.
+
+Embedding에는 `sentence-transformers`를 사용했으며,
+E5 모델의 검색 방식에 맞춰 다음 prefix를 적용했습니다.
+
+- 검색 질문: `query: `
+- 문서 Chunk: `passage: `
+
+Embedding은 cosine similarity 비교를 위해 정규화했습니다.
+
+### 의미 유사도 검증
+
+간단한 문장 비교를 통해 의미가 가까운 문장이
+관련 없는 문장보다 높은 유사도를 갖는지 확인했습니다.
+
+- 개인정보 관련 문장 A-B: `0.9194`
+- 개인정보 문장 A와 축구 문장 C: `0.7908`
+- A-B의 유사도가 더 높음: 확인
+
+유사도 점수 자체를 절대 기준으로 해석하기보다,
+검색 후보 간 상대적인 순위를 중심으로 활용합니다.
+
+### PDF Chunk Embedding 결과
+
+- 전체 Chunk: 162개
+- 생성된 Embedding: 162개
+- Embedding shape: `(162, 384)`
+- Vector 차원: 384
+- NaN: 없음
+- 무한대: 없음
+- 영벡터: 없음
+- Vector 정규화: 확인
+- 실행 device: CUDA
+
+### Token 길이 검증
+
+글자 수 기준 Chunking과 Embedding 모델의 token 입력 길이는
+동일하지 않으므로 별도로 token 수를 확인했습니다.
+
+`passage: ` prefix와 tokenizer의 특수 토큰을 포함한 결과:
+
+- 평균 token 수: 204.2
+- 최대 token 수: 292
+- 512 token 초과 Chunk: 0개
+- 최대 token Chunk: `chunk_id=148`, `page_number=67`
+
+현재 문서와 `chunk_size=500`, `chunk_overlap=100` 기준에서는
+Embedding 과정에서 입력 길이 제한으로 잘리는 Chunk가 없음을 확인했습니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
 - [x] Chunking
-- [ ] Embedding
+- [x] Embedding
 - [ ] FAISS 기반 Vector Search
 - [ ] Retrieval
 - [ ] LLM 연결
