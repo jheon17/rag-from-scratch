@@ -758,6 +758,100 @@ uv run python -m rag_basic.model_comparison
 더 큰 독립 평가셋, faithfulness 및 answer correctness 평가, Vector DB 확장 등을
 검토할 수 있습니다.
 
+## 9. Retrieval 개선 실험
+
+첫 Retrieval 개선 실험으로 Top-K 값에 따른 검색 품질과 Context 길이를
+비교했습니다.
+
+### Top-K란?
+
+Top-K는 Vector Search에서 질문과 가장 유사한 Chunk를 몇 개까지 가져올지
+정하는 값입니다.
+
+- K=1: 가장 유사한 Chunk 1개
+- K=3: 상위 3개
+- K=5: 상위 5개
+- K=10: 상위 10개
+
+Top-K가 너무 작으면 답변에 필요한 정답 근거를 놓칠 수 있습니다. 반대로 너무
+크면 관련성이 낮은 Chunk까지 Context에 포함되어 LLM에 전달할 입력이 길어질 수
+있습니다.
+
+### 실험 방법
+
+`src/rag_basic/top_k_experiment.py`에서 기존 `evaluation.py`의 in-domain 6개
+Case와 사람이 지정한 gold evidence를 그대로 재사용했습니다. 비교한 값은
+K=1, K=3, K=5, K=10입니다.
+
+Embedding model, PDF, Chunk, Chunk Embedding과 FAISS index는 한 번만 생성한 뒤
+모든 Top-K 실험에서 재사용했습니다. 이번 실험은 Retrieval만 비교했으므로 다음
+항목은 수행하지 않았습니다.
+
+- OpenAI 호출
+- Ollama 호출
+- Generation
+- Source citation 평가
+- refusal 평가
+- faithfulness 평가
+
+### 평가 지표
+
+- **Hit@K**: 사람이 지정한 gold evidence 중 하나라도 검색 결과 Top-K 안에
+  존재하는지 확인합니다.
+- **MRR**: 각 질문에서 가장 먼저 등장한 gold evidence 순위의 역수를 구한 뒤
+  평균을 계산합니다.
+- **평균 Context 글자 수**: Top-K 검색 결과를 `build_context()`로 합쳤을 때
+  LLM에 전달될 입력 크기를 비교하기 위한 참고 지표입니다.
+
+### 실제 실행 결과
+
+|  K | Hit 통과 |    MRR | 평균 Context 글자 수 |
+| -: | --------: | -----: | -------------------: |
+|  1 |       5/6 | 0.8333 |                535.3 |
+|  3 |       5/6 | 0.8333 |               1522.2 |
+|  5 |       6/6 | 0.8750 |               2437.3 |
+| 10 |       6/6 | 0.8750 |               4944.8 |
+
+### 결과 해석
+
+`creative_contribution_copyright` 질문의 gold evidence인 `chunk_id=33`은 검색
+순위 4위에 있었습니다. 따라서 K=1과 K=3에서는 검색되지 않았고 K=5부터
+검색됐습니다. 이 때문에 K=1과 K=3의 Hit는 `5/6`, K=5부터는 `6/6`이었습니다.
+
+K=5와 K=10은 Hit가 `6/6`, MRR이 `0.8750`으로 같았습니다. 그러나 평균
+Context 길이는 K=5의 2437.3자에서 K=10의 4944.8자로 약 두 배 증가했습니다.
+현재 6개 평가 Case에서는 K=5가 K=10과 같은 Retrieval 지표를 유지하면서 더
+짧은 Context를 사용했습니다.
+
+이는 `K=5가 최적값이다`라는 결론이 아닙니다. 6개의 수동 평가 Case만 사용한
+소규모 실험이므로 전체 문서나 다른 질문에서도 K=5가 최적이라고 일반화할 수
+없습니다.
+
+### Top-K의 trade-off
+
+Top-K가 너무 작으면 정답 근거를 놓칠 수 있고, 너무 크면 검색 지표의 개선 없이
+Context만 길어질 수 있습니다. 따라서 Retrieval에서는 정답 근거를 충분히
+포함하면서 불필요하게 긴 Context를 만들지 않는 균형이 중요합니다.
+
+### 실행 방법
+
+```bash
+uv run python -m rag_basic.top_k_experiment
+```
+
+첫 실행에서는 Hugging Face의 네트워크 확인이 제한되어 로컬 캐시에 있던 동일한
+모델을 `HF_HUB_OFFLINE=1` 환경에서 불러와 정상 실행했습니다. 이는 실행 환경에서
+적용한 설정이며, 소스 코드에 offline 설정을 추가한 것은 아닙니다.
+
+### 한계
+
+- in-domain 6개 Case만 사용
+- 하나의 PDF 문서만 사용
+- 기존 500자, overlap 100의 Chunking 방식을 그대로 사용
+- 동일한 Embedding 모델 사용
+- LLM Generation 품질은 이번 실험 범위에 포함하지 않음
+- 현재 결과만으로 Top-K의 일반적인 최적값을 결정할 수 없음
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -770,6 +864,9 @@ uv run python -m rag_basic.model_comparison
 - [x] Ollama Local LLM 단독 연결
 - [x] Local RAG 연결
 - [x] OpenAI / Local LLM 비교
+- [x] Top-K Retrieval 비교
+- [ ] similarity threshold 실험
+- [ ] 추가 Retrieval 개선
 
 ## AI 도구 활용
 
