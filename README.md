@@ -652,6 +652,112 @@ Generation만 `OpenAI LLM`에서 `Ollama + qwen3:8b`로 교체했습니다.
 uv run python -m rag_basic.local_rag
 ```
 
+### OpenAI / Local LLM 비교
+
+`src/rag_basic/model_comparison.py`를 구현하여 동일한 Retrieval 결과와 Context를
+OpenAI GPT와 Local LLM에 각각 전달하고 Generation 결과를 비교했습니다.
+
+#### 비교 방법
+
+기존 `evaluation.py`의 9개 평가 Case를 그대로 재사용했습니다.
+
+- 전체 Case: 9개
+- in-domain Case: 6개
+- out-of-domain Case: 3개
+
+각 Case의 Retrieval은 한 번만 수행합니다. 검색 결과로 만든 동일한 Context를
+OpenAI `gpt-5.6-luna`와 Local `qwen3:8b`에 각각 전달하므로, 두 답변의 차이는
+Retrieval 결과가 아니라 Generation 모델의 차이에서 발생합니다.
+
+#### 공통 Retrieval 결과
+
+- in-domain Case: 6개
+- Hit@5: `6/6`
+- MRR: `0.8750`
+
+이 값은 두 모델 각각의 점수가 아니라 두 모델이 공통으로 사용하는 Retrieval
+pipeline의 결과입니다.
+
+#### OpenAI Generation 결과
+
+- in-domain `answer_non_empty`: `6/6`
+- in-domain `unexpected_refusal`이 `False`: `6/6`
+- 정상 Source citation 검증: `6/6`
+- out-of-domain refusal: `3/3`
+
+#### qwen3:8b Generation 결과
+
+- in-domain `answer_non_empty`: `6/6`
+- in-domain `unexpected_refusal`이 `False`: `6/6`
+- 정상 Source citation 검증: `6/6`
+- out-of-domain refusal: `3/3`
+
+자동 지표만 보면 두 모델은 이번 소규모 baseline에서 동일한 결과를 기록했습니다.
+이는 두 모델의 실제 답변 품질이 완전히 동일하다는 의미는 아닙니다.
+
+#### 수동 답변 비교
+
+자동 평가 후 6개 in-domain 답변을 사람이 직접 읽고 비교했습니다.
+
+OpenAI `gpt-5.6-luna`에서 관찰한 내용:
+
+- 여러 Source의 내용을 함께 사용하는 경우가 상대적으로 많았음
+- 배경 설명이나 추가 조건을 포함하여 상대적으로 상세하게 설명하는 경향
+- 가짜 뉴스 신고 질문처럼 여러 대응 경로가 Context에 있을 때 여러 항목을 종합하여 답변
+
+Local `qwen3:8b`에서 관찰한 내용:
+
+- 핵심 Source 한 개를 중심으로 답하는 경우가 많았음
+- 상대적으로 짧고 직접적인 답변을 생성하는 경향
+- 핵심 근거가 검색 순위 4위였던 `creative_contribution_copyright` 질문에서도
+  `[Source 4]`를 사용하여 직접적인 정답 근거를 활용
+- 세 개의 out-of-domain 질문 모두 일반 지식을 사용하지 않고 지정된 refusal 문장으로 응답
+
+이번 소규모 평가에서는 두 모델 모두 기본적인 grounding과 문서 밖 질문 거절에
+성공했습니다. OpenAI는 여러 근거를 종합해 상대적으로 풍부한 답변을 만드는 경향이
+있었고, `qwen3:8b`는 핵심 근거 중심의 간결한 답변을 만드는 경향이 관찰되었습니다.
+이 관찰은 현재 9개 Case에 한정되며 두 모델의 일반적인 성능 우열을 의미하지 않습니다.
+
+#### 중요한 해석
+
+이번 비교에서는 두 모델이 동일한 Retrieval 결과를 사용합니다.
+
+```text
+PDF
+→ Chunking
+→ Embedding
+→ FAISS
+→ Retrieval
+→ Context
+        ├→ OpenAI GPT
+        └→ Ollama qwen3:8b
+```
+
+이를 통해 RAG의 Retrieval 부분과 Generation 모델을 분리하고, 서로 다른 LLM을
+동일한 검색 조건에서 비교할 수 있음을 확인했습니다.
+
+#### 자동 평가의 한계
+
+- 9개 Case만 사용한 소규모 baseline
+- Source 번호의 존재와 유효성만 자동 확인
+- Source citation 검증은 자동 faithfulness 평가가 아님
+- answer correctness 자동 평가는 아직 없음
+- LLM-as-a-Judge를 사용하지 않음
+- 답변 품질 비교는 사람이 직접 읽어 확인
+- 실행시간과 비용 비교는 아직 수행하지 않음
+- 현재 결과로 두 모델의 전체 성능 우열을 판단할 수 없음
+
+#### 실행 방법
+
+```bash
+uv run python -m rag_basic.model_comparison
+```
+
+현재는 from-scratch RAG baseline과 Local LLM 연결, 소규모 모델 비교까지 완료한
+상태입니다. 향후 Retrieval 품질 개선, Chunking 전략 비교, similarity threshold,
+더 큰 독립 평가셋, faithfulness 및 answer correctness 평가, Vector DB 확장 등을
+검토할 수 있습니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -663,7 +769,7 @@ uv run python -m rag_basic.local_rag
 - [x] RAG 품질 평가
 - [x] Ollama Local LLM 단독 연결
 - [x] Local RAG 연결
-- [ ] OpenAI / Local LLM 비교
+- [x] OpenAI / Local LLM 비교
 
 ## AI 도구 활용
 
