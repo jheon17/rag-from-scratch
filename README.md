@@ -980,6 +980,171 @@ uv run python -m rag_basic.similarity_threshold_experiment
 - LLM Generation 품질은 이번 실험에서 평가하지 않음
 - production threshold를 결정한 실험이 아님
 
+### Reranking 실험
+
+현재 FAISS Vector Search는 질문과 Chunk를 각각 Embedding Vector로 만든 뒤
+Vector 유사도를 비교하여 후보를 빠르게 찾습니다. 이것이 1차 검색입니다.
+
+Reranking은 FAISS가 먼저 찾은 소수의 후보를 질문과 Chunk를 함께 비교하는
+별도의 모델로 다시 평가하여 순서를 재정렬하는 2차 단계입니다.
+
+```text
+Query
+↓
+Embedding
+↓
+FAISS Top-5
+↓
+동일한 5개 후보
+↓
+CrossEncoder Reranker
+↓
+후보 순서 재정렬
+```
+
+Reranker가 새로운 Chunk를 검색한 것은 아니며, 기존 FAISS Top-5 후보의 순서만
+다시 정렬했습니다.
+
+#### Bi-Encoder와 Cross-Encoder
+
+현재 Embedding 검색은 다음처럼 질문과 Chunk를 각각 Vector로 만든 뒤 두 Vector의
+유사도를 비교합니다.
+
+```text
+Query → Vector
+Chunk → Vector
+→ 두 Vector 유사도 비교
+```
+
+이 방식은 많은 문서를 빠르게 검색하기에 적합합니다. 반면 Reranker는 다음처럼
+질문과 Chunk를 하나의 pair로 함께 입력하여 관련성 점수를 계산합니다.
+
+```text
+(Query, Chunk)
+→ 둘을 함께 입력
+→ 관련성 점수 계산
+```
+
+후보를 더 자세히 비교할 수 있지만 계산량이 더 크기 때문에, 전체 약 162개
+Chunk가 아니라 FAISS가 먼저 좁힌 Top-5 후보에만 적용했습니다.
+
+#### 사용 모델
+
+Reranker는 multilingual query-document 관련성 비교에 사용할 수 있는
+`BAAI/bge-reranker-v2-m3`를 선택하고 `sentence_transformers.CrossEncoder`로
+로드했습니다. 모델은 한 번만 로드한 뒤 모든 Case에서 재사용했습니다.
+
+#### 실험 방법
+
+`src/rag_basic/reranking_experiment.py`에서 기존 `evaluation.py`의 in-domain
+6개 Case와 `expected_chunk_ids`를 그대로 재사용했습니다. Top-K는 `5`로
+고정했고 Similarity Threshold는 적용하지 않았습니다.
+
+각 질문에서 다음 순서로 비교했습니다.
+
+1. 기존 FAISS Top-5 검색
+2. 동일한 5개의 `(query, chunk text)` pair 생성
+3. CrossEncoder로 reranker score 계산
+4. reranker score가 높은 순서로 재정렬
+5. 기존 FAISS 순위와 Reranking 이후 순위 비교
+
+이번 실험에서는 다음을 수행하지 않았습니다.
+
+- OpenAI 호출
+- Ollama 호출
+- Generation 및 Prompt 변경
+- Chunking 및 Embedding 모델 변경
+- Similarity Threshold 적용
+- Hybrid Search 및 BM25
+
+#### 평가 지표
+
+- **Hit@5**: gold evidence가 Top-5 후보 안에 존재하는지 확인합니다.
+- **MRR**: 각 질문에서 가장 먼저 등장한 gold evidence 순위의 역수를 구한 뒤
+  평균을 계산합니다.
+- **Top-1 gold**: 검색 결과 1위가 gold evidence인 Case 수를 확인합니다.
+
+Reranker는 기존 Top-5 후보의 순서만 바꾸므로 후보 집합이 동일한 이번 실험에서
+Hit@5는 원칙적으로 변하지 않습니다. 핵심 비교 대상은 gold evidence 순위, MRR,
+Top-1 gold의 변화입니다.
+
+#### 실제 전체 결과
+
+| 지표       | FAISS Baseline | Reranked |
+| ---------- | -------------: | -------: |
+| Hit@5      |            6/6 |      6/6 |
+| MRR        |         0.8750 |   1.0000 |
+| Top-1 gold |            5/6 |      6/6 |
+
+Rank 변화는 개선 1개, 동일 5개, 악화 0개였습니다.
+
+#### Case별 결과
+
+| Case                              | FAISS gold rank | Reranked gold rank |
+| --------------------------------- | --------------: | -----------------: |
+| copyright_in_domain               |               1 |                  1 |
+| creative_contribution_copyright   |               4 |                  1 |
+| ai_assignment_submission          |               1 |                  1 |
+| midjourney_contest_controversy    |               1 |                  1 |
+| fake_news_damage_report           |               1 |                  1 |
+| generative_ai_work_benefits       |               1 |                  1 |
+
+#### 가장 중요한 Case
+
+`creative_contribution_copyright`의 gold evidence인 `chunk_id=33`은 기존 FAISS
+검색에서 4위였습니다. Reranking 후에는 동일한 Top-5 후보 안에서 1위로
+이동했습니다.
+
+이 변화로 전체 MRR은 `0.8750 → 1.0000`, Top-1 gold는 `5/6 → 6/6`으로
+증가했습니다.
+
+#### 결과 해석
+
+현재 6개 in-domain Case에서는 Reranker가 FAISS의 후보 집합을 바꾸지 않으면서
+gold evidence의 순서를 개선했습니다. 특히 기존 4위였던 한 정답 근거를 1위로
+재정렬하면서 MRR과 Top-1 gold 지표가 개선됐습니다.
+
+하지만 Reranking이 항상 성능을 높이거나 `bge-reranker-v2-m3`가 최적이라는
+의미는 아닙니다. 이번 실험에서는 LLM Generation을 수행하지 않았으므로 최종 RAG
+답변 품질까지 실제로 개선됐다고 결론 내릴 수도 없습니다.
+
+#### 현재 RAG에서의 의미
+
+현재 RAG는 Top-5 Chunk를 모두 LLM에 전달합니다. 따라서 정답 근거가 FAISS
+4위여도 LLM이 이를 읽고 사용할 수 있으며, 이전 Local LLM 비교에서 실제로
+`qwen3:8b`가 `[Source 4]`를 사용한 사례가 있었습니다. 현재 작은 baseline에서
+Reranking이 필수적인 기능이라고 볼 수는 없습니다.
+
+Reranking은 다음과 같은 상황에서 의미가 더 커질 수 있습니다.
+
+- LLM에 더 적은 수의 Chunk만 전달하려는 경우
+- 1차 검색 후보 수가 많아지는 경우
+- 관련 근거를 검색 결과 상위에 배치하려는 경우
+
+#### 계산 비용의 trade-off
+
+FAISS Embedding 검색은 많은 Chunk를 빠르게 검색하는 1차 단계입니다. CrossEncoder
+Reranker는 각 `(query, chunk)` pair를 함께 처리하므로 상대적으로 계산량이 더
+큽니다. 이 때문에 이번 실험에서도 전체 Chunk가 아닌 Top-5 후보에만 Reranker를
+적용했습니다.
+
+#### 실행 방법
+
+```bash
+uv run python -m rag_basic.reranking_experiment
+```
+
+#### 실험의 한계
+
+- in-domain 6개 Case만 사용
+- 하나의 PDF만 사용
+- Top-K=5만 사용
+- 하나의 Reranker 모델만 사용
+- 한 Case에서만 순위 개선이 발생
+- LLM Generation 품질은 평가하지 않음
+- Reranking의 latency나 GPU 비용은 측정하지 않음
+- 현재 결과를 일반적인 Reranking 성능으로 일반화할 수 없음
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -994,6 +1159,7 @@ uv run python -m rag_basic.similarity_threshold_experiment
 - [x] OpenAI / Local LLM 비교
 - [x] Top-K Retrieval 비교
 - [x] similarity threshold 실험
+- [x] Reranking 비교
 - [ ] 추가 Retrieval 개선
 
 ## AI 도구 활용
