@@ -442,6 +442,101 @@ uv run python -m rag_basic.evaluation
 수행했습니다. 이후에는 Local LLM, Retrieval 검색 품질 개선, Chunking 전략 비교,
 더 큰 독립 평가셋, faithfulness 및 answer correctness 평가로 확장할 수 있습니다.
 
+## 8. Local LLM 연결
+
+기존 OpenAI API 기반 Generation을 바로 교체하기 전에,
+내 PC에서 실행되는 Local LLM을 Python에서 직접 호출할 수 있는지 단계적으로
+확인했습니다.
+
+### Ollama 설치 및 모델 실행
+
+- Ollama: 0.33.3
+- Local model: `qwen3:8b`
+- 모델 크기: 약 5.2GB
+- NVIDIA RTX 5070 Ti에서 실행 확인
+
+Ollama는 Local LLM 모델 자체가 아닙니다. 로컬에 설치된 모델을 실행하고,
+터미널이나 HTTP API를 통해 Python 같은 프로그램이 모델에 요청할 수 있도록
+연결해 주는 도구입니다.
+
+다음 명령으로 모델을 단독 실행했습니다.
+
+```bash
+ollama run qwen3:8b
+```
+
+`RAG가 무엇인지 두 문장으로 설명해줘.`라는 질문에 한국어 답변이
+정상적으로 생성되는 것을 확인했습니다.
+
+### Python에서 Ollama API 호출
+
+`src/rag_basic/local_llm.py`를 구현하여 외부 Python 패키지 없이
+다음 표준 라이브러리만 사용했습니다.
+
+- `json`
+- `urllib.request`
+- `urllib.error`
+
+Python에서 다음 Ollama Local API로 HTTP 요청을 보냅니다.
+
+```text
+http://localhost:11434/api/chat
+```
+
+요청에는 다음 설정을 사용합니다.
+
+- model: `qwen3:8b`
+- `stream: false`
+- `think: false`
+
+`stream: false`는 응답을 토큰 단위로 나누어 받지 않고 완성된 JSON 응답을
+한 번에 받기 위한 설정입니다. `think: false`는 Qwen3의 별도 thinking 출력을
+끄고 최종 답변만 받기 위한 설정입니다.
+
+Ollama가 반환한 JSON에서 `message.content`를 추출하여 최종 답변 문자열로
+사용합니다.
+
+### Python 실행 검증
+
+```bash
+uv run python -m rag_basic.local_llm
+```
+
+실제 테스트 질문은 다음과 같습니다.
+
+```text
+RAG에서 Retrieval이 필요한 이유를 두 문장으로 설명해줘.
+```
+
+실행 결과 `qwen3:8b`가 정상적인 한국어 답변을 반환했습니다.
+추가로 `nvidia-smi`에서 `ollama/llama-server`가 약 5.6GB의 GPU Memory를
+사용하는 것이 확인되어, Python API 호출 시에도 Local LLM이 GPU에서 실행되고
+있음을 확인했습니다.
+
+### 현재 단계의 범위
+
+이번 단계에서는 다음 작업을 하지 않았습니다.
+
+- PDF 및 Chunking 변경
+- Embedding 변경
+- FAISS 변경
+- Retrieval 변경
+- RAG Context와 Local LLM 연결
+- OpenAI LLM과 Local LLM 품질 비교
+
+현재는 다음 흐름까지만 확인한 상태입니다.
+
+```text
+Python
+→ Ollama Local API
+→ qwen3:8b
+→ 답변
+```
+
+다음 단계에서는 기존 Retrieval과 Context를 그대로 재사용하고,
+OpenAI API 대신 `qwen3:8b`가 문서 기반 답변을 생성하도록 Local RAG를
+연결할 예정입니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -451,6 +546,9 @@ uv run python -m rag_basic.evaluation
 - [x] Retrieval
 - [x] LLM 연결
 - [x] RAG 품질 평가
+- [x] Ollama Local LLM 단독 연결
+- [ ] Local RAG 연결
+- [ ] OpenAI / Local LLM 비교
 
 ## AI 도구 활용
 
