@@ -314,8 +314,133 @@ export OPENAI_API_KEY="발급받은_API_KEY"
 uv run python -m rag_basic.llm
 ```
 
-현재 구현은 RAG의 전체 흐름을 연결한 첫 baseline이며,
-검색과 답변의 품질을 체계적으로 측정하는 RAG 품질 평가는 아직 구현하지 않았습니다.
+현재 구현은 RAG의 전체 흐름을 연결한 첫 baseline입니다.
+
+## 7. RAG 품질 평가
+
+완성된 RAG가 단순히 답변을 생성하는지를 넘어 다음 항목을 확인하기 위해
+소규모 baseline 평가를 직접 구현했습니다.
+
+1. Retrieval이 사람이 지정한 정답 근거(gold evidence)를 찾는지
+2. 검색 결과에서 정답 근거가 얼마나 높은 순위에 있는지
+3. 생성 답변이 실제 Source 번호를 사용하는지
+4. 문서 밖 질문에 일반 지식으로 답하지 않고 거절하는지
+
+RAGAS, LangChain 평가 기능, LLM-as-a-Judge 및 별도 평가용 LLM은 사용하지 않고
+기본 지표를 Python으로 직접 구현했습니다.
+
+### 평가 데이터 구성
+
+PDF의 실제 Chunk 본문을 사람이 직접 확인하여 질문과 gold evidence를
+수동으로 구성했습니다.
+
+- 전체 Case: 9개
+- in-domain Case: 6개
+- out-of-domain Case: 3개
+
+in-domain Case는 다음과 같이 서로 다른 주제를 포함합니다.
+
+- 생성형 AI 이미지 저작권
+- 이용자의 창작적 기여와 저작권
+- 생성형 AI 결과물의 과제 제출
+- 미드저니 미술대회 사례
+- 생성형 AI 가짜 뉴스 피해 신고
+- 생성형 AI의 업무 활용 장점
+
+질문에 따라 하나 이상의 Chunk가 모두 유효한 근거가 될 수 있으므로
+복수의 `expected_chunk_ids`를 허용했습니다. 예를 들어 `[68, 69, 70]`이면
+세 Chunk 중 하나라도 Top-5에 검색될 때 Retrieval Hit로 판단합니다.
+
+### 평가 지표
+
+#### Hit@5
+
+사람이 지정한 gold evidence 중 하나라도 검색 결과 Top-5 안에 있는지 확인합니다.
+
+#### Reciprocal Rank
+
+검색 결과에서 가장 먼저 등장한 gold evidence 순위의 역수입니다.
+
+- 1위 → `1.0`
+- 2위 → `0.5`
+- 4위 → `0.25`
+
+#### MRR
+
+각 in-domain 질문의 Reciprocal Rank 평균입니다. 이번 평가에서는
+6개 in-domain 질문의 Reciprocal Rank 평균을 사용했습니다.
+
+#### Source citation 검증
+
+생성 답변에 `[Source N]` 형태의 Source 번호가 존재하고,
+그 번호가 실제 Retrieval 결과 범위 안에 있는지 확인합니다.
+Retrieval 결과가 Source 1~5까지라면 `[Source 1]`과 `[Source 5]`는 유효하지만,
+`[Source 8]`은 유효하지 않습니다.
+
+이 검사는 Source 번호의 형식과 존재 여부를 확인합니다. 답변의 모든 문장이
+해당 Source에 의해 완전히 뒷받침되는지를 자동으로 판단하는 faithfulness 평가는 아닙니다.
+
+#### Out-of-domain refusal
+
+문서에 답이 없는 질문에 LLM의 일반 지식으로 답하지 않고 다음 문장으로
+정확히 응답하는지 확인합니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+### 실제 실행 결과
+
+- 전체 평가 Case: 9
+- in-domain Case: 6
+- out-of-domain Case: 3
+- in-domain Hit@5: `6/6`
+- in-domain MRR: `0.8750`
+- 정상 Source citation 검증: `6/6`
+- out-of-domain refusal: `3/3`
+
+MRR이 `1.0`이 아닌 이유는 `creative_contribution_copyright` 질문의
+gold evidence인 `chunk_id=33`이 검색 결과 4위에 있었기 때문입니다.
+이 Case의 Reciprocal Rank는 `1 / 4 = 0.25`입니다.
+
+즉 모든 in-domain 질문에서 gold evidence가 Top-5 안에는 포함됐지만,
+모든 질문의 정답 근거가 항상 검색 결과 1위였던 것은 아닙니다.
+
+### 수동 답변 검토
+
+6개 in-domain 질문의 생성 답변을 사람이 직접 읽고,
+검색된 Context의 내용과 크게 어긋나지 않는지 확인했습니다.
+이는 자동 faithfulness 평가가 아니라 수동 검토 결과입니다.
+
+### 한계
+
+- 평가 Case가 9개뿐인 소규모 baseline
+- 사람이 직접 질문과 gold evidence를 구성한 수동 평가셋
+- 동일 문서를 바탕으로 개발 과정에서 구성했으므로 대규모 독립 benchmark가 아님
+- 자동 faithfulness 평가를 아직 구현하지 않음
+- 자동 answer correctness 평가를 아직 구현하지 않음
+- 현재 결과가 전체 RAG 품질을 대표하지 않음
+
+### 평가 코드
+
+주요 평가 파일:
+
+- `src/rag_basic/evaluation.py`: 최종 9개 Case의 Retrieval과 Generation baseline 평가
+
+평가셋 구성 과정에서 사용한 보조 스크립트:
+
+- `src/rag_basic/evaluation_discovery.py`: 문서 전체의 실제 Chunk를 사람이 살펴보고 평가 질문 후보를 선정하기 위한 탐색용 스크립트
+- `src/rag_basic/evaluation_retrieval_check.py`: 잠정 gold evidence가 실제 Retrieval에서 어떤 순위로 검색되는지 본문과 함께 사전 확인하는 스크립트
+
+### 실행 방법
+
+```bash
+uv run python -m rag_basic.evaluation
+```
+
+현재까지 기본적인 from-scratch RAG baseline을 구현하고 소규모 품질 평가까지
+수행했습니다. 이후에는 Local LLM, Retrieval 검색 품질 개선, Chunking 전략 비교,
+더 큰 독립 평가셋, faithfulness 및 answer correctness 평가로 확장할 수 있습니다.
 
 ## 진행 상황
 
@@ -325,7 +450,7 @@ uv run python -m rag_basic.llm
 - [x] FAISS 기반 Vector Search
 - [x] Retrieval
 - [x] LLM 연결
-- [ ] RAG 품질 평가
+- [x] RAG 품질 평가
 
 ## AI 도구 활용
 
