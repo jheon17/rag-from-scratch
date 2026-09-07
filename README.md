@@ -1145,6 +1145,161 @@ uv run python -m rag_basic.reranking_experiment
 - Reranking의 latency나 GPU 비용은 측정하지 않음
 - 현재 결과를 일반적인 Reranking 성능으로 일반화할 수 없음
 
+### Chunking configuration 비교
+
+현재 기본 Chunking은 `chunk_size=500`, `chunk_overlap=100`이며, 기존
+`create_chunks()`는 페이지 경계를 유지하면서 글자 수를 기준으로 Chunk를
+생성합니다.
+
+이번 실험에서는 단순히 Chunk Size만 바꾼 것이 아니라 약 20% overlap 비율을
+유지한 세 Chunking configuration을 비교했습니다. 설정이 달라질 때 전체 Chunk
+개수, 평균 Chunk 길이, Retrieval 순위와 Top-5 Context 길이가 어떻게 변하는지
+확인했습니다.
+
+#### Gold 평가 방식
+
+기존 `evaluation.py`의 `expected_chunk_ids`는 baseline인 500/100 설정에서
+만들어진 Chunk ID입니다. Chunking configuration이 달라지면 Chunk ID와 Chunk
+text 자체도 달라지므로 기존 ID를 새로운 Chunk에 직접 적용할 수 없습니다.
+
+따라서 다음 과정으로 공통 평가 기준을 만들었습니다.
+
+1. baseline 500/100 Chunk 생성
+2. 기존 `expected_chunk_ids`를 baseline Chunk와 연결
+3. 각 gold Chunk가 위치한 `page_number` 추출
+4. 새로운 Chunking 결과에서 해당 gold page가 검색되는지 평가
+
+#### Page-level 평가의 의미
+
+**Page Hit@5**는 gold evidence가 존재하는 페이지 중 하나라도 Top-5 검색 결과에
+포함되면 성공으로 판단합니다. **Page-level MRR**은 가장 먼저 등장한 gold page의
+검색 순위로 Reciprocal Rank를 계산한 뒤 전체 질문의 평균을 구한 값입니다.
+
+이는 기존 Chunk ID 기반 MRR과 동일한 평가가 아닙니다. Chunking이 바뀌어도
+공통으로 사용할 수 있도록 만든 더 느슨한 page-level 평가입니다.
+
+#### 실험 설정
+
+| Chunk Size | Overlap |
+| ---------: | ------: |
+|        300 |      60 |
+|        500 |     100 |
+|        800 |     160 |
+
+세 설정 모두 약 20% overlap 비율을 유지했습니다. Top-K는 `5`로 고정하고 동일한
+Embedding 모델을 사용했으며 Similarity Threshold와 Reranking은 적용하지
+않았습니다. OpenAI, Ollama 및 Generation도 사용하지 않았습니다.
+
+PDF와 Embedding 모델은 한 번만 로드하고, 내용이 달라지는 다음 자원은 각
+configuration마다 새로 생성했습니다.
+
+- Chunks
+- Chunk Embeddings
+- FAISS index
+
+#### 실제 실행 결과
+
+| Chunk Size | Overlap | Chunk Count | Avg Length | Page Hit@5 | Page MRR | Avg Context |
+| ---------: | ------: | ----------: | ---------: | ---------: | -------: | ----------: |
+|        300 |      60 |         260 |      265.3 |        6/6 |   0.7917 |      1534.0 |
+|        500 |     100 |         162 |      413.4 |        6/6 |   0.8750 |      2437.3 |
+|        800 |     160 |         111 |      582.2 |        6/6 |   0.7833 |      3579.2 |
+
+#### Chunk 개수 변화
+
+Chunk Size가 작으면 문서를 더 잘게 나누므로 전체 Chunk 수가 증가하고, Chunk가
+커지면 전체 Chunk 수가 감소했습니다.
+
+- 300/60: 260개
+- 500/100: 162개
+- 800/160: 111개
+
+#### Context 길이 변화
+
+Top-K를 5로 동일하게 유지했기 때문에 큰 Chunk를 사용할수록 LLM에 전달할 수
+있는 Context 길이도 증가했습니다.
+
+- 300/60: 평균 1534.0자
+- 500/100: 평균 2437.3자
+- 800/160: 평균 3579.2자
+
+큰 Chunk는 더 많은 문맥을 포함하는 대신 Context 입력량도 늘어나므로 항상 더
+효율적이라고 볼 수는 없습니다.
+
+#### Retrieval 결과
+
+세 configuration 모두 현재 6개 평가 Case에서 Page Hit@5 `6/6`을 기록했습니다.
+즉 모든 설정이 Top-5 안에서 gold evidence가 위치한 페이지를 검색했습니다.
+
+Page-level MRR은 300/60에서 `0.7917`, 500/100에서 `0.8750`, 800/160에서
+`0.7833`이었습니다. 현재 6개 Case에서는 500/100 configuration이 세 설정 중
+가장 높은 Page-level MRR을 보였지만, 이것이 일반적인 최적 Chunking이라는
+의미는 아닙니다.
+
+#### 결과 해석
+
+300/60 설정:
+
+- Chunk 수가 가장 많음
+- 평균 Context가 가장 짧음
+- Page Hit@5 `6/6`
+- Page-level MRR `0.7917`
+
+500/100 설정:
+
+- 현재 baseline
+- Page Hit@5 `6/6`
+- 세 configuration 중 가장 높은 Page-level MRR `0.8750`
+- Context 길이는 중간 수준
+
+800/160 설정:
+
+- Chunk 수가 가장 적음
+- 평균 Context가 가장 김
+- Page Hit@5 `6/6`
+- Page-level MRR `0.7833`
+
+현재 소규모 평가에서는 큰 Chunk가 더 많은 Context를 제공했지만 Retrieval 순위
+지표가 반드시 좋아지지는 않았습니다. 작은 Chunk는 Context 길이를 줄였지만
+Page-level MRR이 baseline보다 낮았습니다.
+
+#### Chunking의 trade-off
+
+작은 Chunk의 특징:
+
+- 더 세밀한 검색 단위
+- 전체 Chunk 수 증가
+- Context가 짧아질 수 있음
+- 문맥이 여러 Chunk로 나뉠 수 있음
+
+큰 Chunk의 특징:
+
+- 한 Chunk에 더 많은 문맥 포함
+- 전체 Chunk 수 감소
+- Context가 길어질 수 있음
+- 질문과 직접 관련 없는 내용도 함께 포함될 수 있음
+
+Chunk Size를 무조건 작게 또는 크게 만드는 것이 목적은 아닙니다. 검색 정확도와
+문맥 보존 사이의 균형을 실제 데이터로 확인해야 합니다.
+
+#### 평가 한계
+
+- in-domain 6개 Case만 사용
+- 하나의 PDF만 사용
+- 세 configuration만 비교
+- 약 20% overlap 비율을 유지했지만 Chunk Size와 Overlap이 함께 변경됨
+- 순수하게 Chunk Size 하나의 효과만 분리한 실험이 아님
+- Page-level gold는 Chunk-level gold evidence보다 느슨한 평가 기준
+- 같은 gold page의 관련 없는 Chunk가 검색돼도 Hit로 계산될 수 있음
+- LLM Generation 품질은 평가하지 않음
+- 현재 결과로 500/100을 일반적인 최적값이라고 결론 내릴 수 없음
+
+#### 실행 방법
+
+```bash
+uv run python -m rag_basic.chunk_size_experiment
+```
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -1160,6 +1315,7 @@ uv run python -m rag_basic.reranking_experiment
 - [x] Top-K Retrieval 비교
 - [x] similarity threshold 실험
 - [x] Reranking 비교
+- [x] Chunking configuration 비교
 - [ ] 추가 Retrieval 개선
 
 ## AI 도구 활용
