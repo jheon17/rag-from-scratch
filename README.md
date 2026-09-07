@@ -852,6 +852,134 @@ uv run python -m rag_basic.top_k_experiment
 - LLM Generation 품질은 이번 실험 범위에 포함하지 않음
 - 현재 결과만으로 Top-K의 일반적인 최적값을 결정할 수 없음
 
+### Similarity Threshold 실험
+
+FAISS의 Top-K 검색은 질문이 문서와 관련이 없어도 가장 유사한 K개 Chunk를
+항상 반환합니다. Top-K가 **최대 몇 개까지 가져올 것인지**를 정한다면,
+Similarity Threshold는 **최소 어느 정도 유사해야 검색 결과로 인정할 것인지**를
+정합니다.
+
+```text
+Top-K = 5
+
+score >= threshold
+→ 검색 결과 유지
+
+score < threshold
+→ 검색 결과 제거
+```
+
+Similarity score의 절대값은 Embedding 모델과 데이터에 따라 달라집니다. 따라서
+한 시스템에서 확인한 threshold를 다른 RAG 시스템에 그대로 적용할 수는 없습니다.
+
+#### 실험 방법
+
+`src/rag_basic/similarity_threshold_experiment.py`에서 기존 `evaluation.py`의
+9개 Case를 그대로 재사용했습니다.
+
+- in-domain Case: 6개
+- out-of-domain Case: 3개
+- 고정 Top-K: `5`
+- 비교 Threshold: `0.85`, `0.88`, `0.90`, `0.92`, `0.94`, `0.96`
+
+각 Case의 FAISS Top-5 Retrieval은 한 번만 수행하고, 동일한 검색 결과에 여러
+Threshold를 적용했습니다. Embedding model, PDF, Chunk, Chunk Embedding과 FAISS
+index도 한 번 생성한 뒤 모든 Case에서 재사용했습니다.
+
+이번 실험에서는 다음을 수행하지 않았습니다.
+
+- OpenAI API 호출
+- Ollama 호출
+- Generation
+- LLM refusal 평가
+- faithfulness 평가
+- answer correctness 평가
+
+#### 평가 방법
+
+in-domain Case에서는 Threshold 적용 후에도 gold evidence가 남아 있는지, MRR,
+평균 surviving Chunk 수와 평균 Context 글자 수를 확인했습니다.
+
+out-of-domain Case에서는 Threshold 적용 후 검색 결과가 하나도 남지 않으면
+`rejected = True`로 평가했습니다. 이는 LLM이 답변을 거절하는 능력을 평가한 것이
+아니라, Retrieval 단계에서 OOD 질문의 검색 결과를 제거할 수 있는지 확인한
+실험입니다.
+
+#### 실제 실행 결과
+
+| Threshold | Gold retained |    MRR | OOD rejected | 평균 Chunk | 평균 Context |
+| --------: | ------------: | -----: | -----------: | ---------: | -----------: |
+|      0.85 |           6/6 | 0.8750 |          3/3 |       4.50 |       2201.8 |
+|      0.88 |           6/6 | 0.8750 |          3/3 |       4.33 |       2112.3 |
+|      0.90 |           5/6 | 0.7083 |          3/3 |       3.67 |       1793.7 |
+|      0.92 |           5/6 | 0.7083 |          3/3 |       1.67 |        866.3 |
+|      0.94 |           0/6 | 0.0000 |          3/3 |       0.00 |          0.0 |
+|      0.96 |           0/6 | 0.0000 |          3/3 |       0.00 |          0.0 |
+
+#### OOD 결과
+
+세 out-of-domain 질문의 Top-5 최고 similarity score는 모두 `0.80` 미만이었습니다.
+따라서 테스트한 `0.85` 이상의 모든 Threshold에서 검색 결과가 전부 제거되어
+OOD rejected가 `3/3`이었습니다.
+
+이번 세 질문에서 score 차이가 분명했다는 사실만으로 모든 OOD 질문을 하나의
+threshold로 안정적으로 구분할 수 있다고 일반화할 수는 없습니다.
+
+#### 정상 질문 결과
+
+Threshold `0.85`와 `0.88`에서는 gold evidence `6/6`, MRR `0.8750`, OOD rejected
+`3/3`을 유지했습니다. 특히 `0.88`에서는 평균 surviving Chunk가 4.33개,
+평균 Context 길이가 2112.3자로 감소했습니다.
+
+Threshold가 없던 기존 Top-5 실험의 평균 Context 길이는 2437.3자였습니다. 현재
+평가 Case에서는 Threshold `0.88`이 일부 검색 결과를 제거하면서도 gold evidence와
+MRR을 유지하는 결과를 보였습니다.
+
+#### Threshold가 너무 높은 경우
+
+Threshold가 `0.90`이 되면서 `midjourney_contest_controversy` Case의 gold
+evidence가 제거됐습니다. 이 질문에서 가장 높은 gold evidence similarity score는
+`0.8902`였기 때문에 `0.90` 기준을 통과하지 못했습니다.
+
+그 결과 gold retained는 `5/6`, MRR은 `0.7083`으로 감소했습니다. Threshold
+`0.94` 이상에서는 모든 in-domain 검색 결과까지 제거되어 gold retained `0/6`,
+MRR `0.0000`, 평균 Context 0자가 됐습니다.
+
+#### 결과 해석
+
+Similarity Threshold는 FAISS가 항상 Top-K를 반환하는 문제를 완화하여 유사도가
+낮은 검색 결과를 제거할 수 있었습니다. 현재 소규모 평가에서는 `0.85`와 `0.88`
+모두 gold evidence와 MRR을 유지하면서 세 OOD 질문을 모두 제거했습니다.
+
+테스트한 값 중 `0.88`은 `0.85`와 같은 gold retained, MRR, OOD rejected 결과를
+유지하면서 평균 surviving Chunk와 Context 길이가 조금 더 작았습니다. 이는 현재
+9개 평가 Case와 현재 Embedding 모델에 한정된 관찰이며, `0.88`이 최적 Threshold이거나
+새 문서와 질문에도 같은 값이 적합하다는 의미는 아닙니다.
+
+#### Threshold의 trade-off
+
+Threshold가 너무 낮으면 관련성이 낮은 Chunk가 많이 남을 수 있고, 너무 높으면
+답변에 필요한 정답 근거까지 제거될 수 있습니다. Threshold는 단순히 높이는 것이
+목적이 아니라 **정답 근거 보존**과 **불필요한 검색 결과 제거** 사이의 균형을
+검증하며 정해야 합니다.
+
+#### 실행 방법
+
+```bash
+uv run python -m rag_basic.similarity_threshold_experiment
+```
+
+#### 실험의 한계
+
+- 전체 평가 Case가 9개뿐임
+- in-domain 6개, OOD 3개만 사용
+- 하나의 PDF만 사용
+- 하나의 Embedding 모델만 사용
+- Threshold 후보도 제한적
+- OOD 질문 3개에서 나타난 score 분리를 일반화할 수 없음
+- LLM Generation 품질은 이번 실험에서 평가하지 않음
+- production threshold를 결정한 실험이 아님
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -865,7 +993,7 @@ uv run python -m rag_basic.top_k_experiment
 - [x] Local RAG 연결
 - [x] OpenAI / Local LLM 비교
 - [x] Top-K Retrieval 비교
-- [ ] similarity threshold 실험
+- [x] similarity threshold 실험
 - [ ] 추가 Retrieval 개선
 
 ## AI 도구 활용
