@@ -513,9 +513,9 @@ RAG에서 Retrieval이 필요한 이유를 두 문장으로 설명해줘.
 사용하는 것이 확인되어, Python API 호출 시에도 Local LLM이 GPU에서 실행되고
 있음을 확인했습니다.
 
-### 현재 단계의 범위
+### Local API 단독 호출 단계의 범위
 
-이번 단계에서는 다음 작업을 하지 않았습니다.
+이 단독 호출 단계에서는 다음 작업을 하지 않았습니다.
 
 - PDF 및 Chunking 변경
 - Embedding 변경
@@ -533,9 +533,124 @@ Python
 → 답변
 ```
 
-다음 단계에서는 기존 Retrieval과 Context를 그대로 재사용하고,
-OpenAI API 대신 `qwen3:8b`가 문서 기반 답변을 생성하도록 Local RAG를
-연결할 예정입니다.
+이 확인을 바탕으로 기존 Retrieval 및 Context와 Local LLM을 연결했습니다.
+
+### Local RAG 연결
+
+`src/rag_basic/local_rag.py`를 구현하여 기존 RAG의 검색 부분을 새로 만들지 않고
+다음 기능을 그대로 재사용했습니다.
+
+- PDF Loading
+- Chunking
+- Embedding
+- FAISS Vector Search
+- Retrieval
+- Context 생성
+
+기존 OpenAI 기반 구조는 다음과 같습니다.
+
+```text
+질문
+→ Retrieval
+→ Context
+→ OpenAI LLM
+→ 답변
+```
+
+이 구조에서 Generation 부분만 교체하여 다음 Local RAG를 구성했습니다.
+
+```text
+질문
+→ Retrieval
+→ Context
+→ Ollama
+→ qwen3:8b
+→ 답변
+```
+
+### Local RAG Prompt
+
+Local LLM에도 기존 OpenAI RAG와 의미가 같은 grounding 규칙을 전달했습니다.
+
+- 제공된 Context만 근거로 답변
+- Context에 없는 내용을 일반 지식으로 보충하거나 추측하지 않음
+- 근거가 없으면 `제공된 문서에서 확인할 수 없습니다.`라고 답변
+- 사용한 근거를 `[Source N]` 형태로 표시
+- 간결한 한국어로 답변
+
+### 정상 질문 검증
+
+질문: `생성형 AI가 만든 이미지의 저작권은 누구에게 있나요?`
+
+- FAISS index: `[27, 38, 2, 92, 34]`
+- `chunk_id`: `[28, 39, 3, 93, 35]`
+- Context 글자 수: 2305
+
+기존 OpenAI RAG에서 사용한 동일 질문과 같은 Retrieval 결과가 나왔습니다.
+Retrieval 부분은 변경하지 않고 Generation 모델만 Local LLM으로 교체했기 때문입니다.
+
+`qwen3:8b`는 검색된 Context를 바탕으로 저작권 관련 답변을 생성했고,
+답변에 `[Source 1]`을 포함했습니다.
+
+### 문서 밖 질문 검증
+
+질문: `프랑스의 수도는 어디인가요?`
+
+- FAISS index: `[135, 101, 64, 107, 95]`
+- `chunk_id`: `[136, 102, 65, 108, 96]`
+- Context 글자 수: 2501
+
+`qwen3:8b`는 자신의 일반 지식으로 `파리`라고 답하지 않고 다음 문장으로
+정확히 응답했습니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+첫 Local RAG baseline의 두 테스트 질문에서 Context 밖 일반 지식을 사용하지
+않도록 한 grounding 규칙이 의도대로 동작하는 것을 확인했습니다. 다만 두 Case만으로
+Local RAG 전체 품질이 검증됐다고 볼 수는 없습니다.
+
+### 검증 결과
+
+- 정상 질문의 답변이 비어 있지 않은가: `True`
+- 정상 질문의 답변에 `[Source`가 포함되는가: `True`
+- 문서 밖 질문의 지정된 refusal 문장 일치: `True`
+
+`nvidia-smi`에서 `ollama/llama-server`가 약 5.6GB의 GPU Memory를 사용하는 것이
+확인되어, Local RAG의 `qwen3:8b` Generation이 NVIDIA RTX 5070 Ti에서 실행되고
+있음을 확인했습니다.
+
+### 현재 단계의 의미
+
+RAG의 Retrieval 부분과 Generation 모델은 서로 분리할 수 있습니다.
+현재 프로젝트에서는 다음 부분을 동일하게 유지했습니다.
+
+```text
+PDF
+→ Chunking
+→ Embedding
+→ FAISS
+→ Retrieval
+→ Context
+```
+
+Generation만 `OpenAI LLM`에서 `Ollama + qwen3:8b`로 교체했습니다.
+따라서 같은 Retrieval pipeline을 사용하면서 서로 다른 LLM을 비교할 수 있는
+구조가 만들어졌습니다.
+
+### 한계
+
+- 정상 질문 1개와 문서 밖 질문 1개만 사용한 Local RAG 검증
+- 두 Case만으로 Local RAG 전체 성능을 대표할 수 없음
+- Source 표기의 존재만 확인했으며 자동 faithfulness 평가는 아님
+- OpenAI와 Local LLM의 본격적인 품질 비교는 아직 수행하지 않음
+
+### 실행 방법
+
+```bash
+uv run python -m rag_basic.local_rag
+```
 
 ## 진행 상황
 
@@ -547,7 +662,7 @@ OpenAI API 대신 `qwen3:8b`가 문서 기반 답변을 생성하도록 Local RA
 - [x] LLM 연결
 - [x] RAG 품질 평가
 - [x] Ollama Local LLM 단독 연결
-- [ ] Local RAG 연결
+- [x] Local RAG 연결
 - [ ] OpenAI / Local LLM 비교
 
 ## AI 도구 활용
