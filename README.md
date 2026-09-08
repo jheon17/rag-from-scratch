@@ -1456,7 +1456,7 @@ PostgreSQL 데이터는 Container 자체가 아니라 Docker named volume인
 이는 Container 재시작 수준의 확인이며, Volume 삭제와 복구까지 검증한 실험은
 아닙니다.
 
-#### 아직 수행하지 않은 작업
+#### 환경 구성 단계에서 수행하지 않은 작업
 
 - chunks Table 생성
 - Embedding column 생성
@@ -1468,7 +1468,7 @@ PostgreSQL 데이터는 Container 자체가 아니라 Docker named volume인
 - FastAPI
 - LangChain
 
-#### 다음 단계
+#### 환경 구성 다음 단계
 
 다음 단계는 **Chunk + Embedding PostgreSQL 적재**입니다.
 
@@ -1482,8 +1482,247 @@ Embedding
 PostgreSQL + pgvector
 ```
 
-현재는 PostgreSQL + pgvector 실행 환경까지만 구성했으며, 데이터 적재는 아직
-구현하지 않았습니다.
+이 환경 구성을 마친 뒤 아래 단계에서 실제 데이터 적재를 구현했습니다.
+
+### Chunk + Embedding PostgreSQL 적재
+
+기존 FAISS baseline에서는 프로그램을 실행할 때 Chunk Embedding과 FAISS Index를
+메모리에 구성했습니다. 이번 단계에서는 같은 PDF, Chunking과 Embedding 모델을
+재사용하면서 Chunk와 Embedding을 PostgreSQL에 영속적으로 저장했습니다.
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+SQL INSERT / UPSERT
+↓
+PostgreSQL + pgvector
+```
+
+#### 기존 RAG 설정 재사용
+
+- PDF: `data/ai_ethics_guide.pdf`
+- `chunk_size`: `500`
+- `chunk_overlap`: `100`
+- 생성 Chunk: `162`
+- Embedding model: `intfloat/multilingual-e5-small`
+- Embedding dimension: `384`
+
+새 Chunking이나 Embedding 모델을 만든 것이 아니라 기존 baseline pipeline을
+그대로 재사용했습니다.
+
+#### Python에서 PostgreSQL 연결
+
+PostgreSQL 연결과 Vector 타입 처리를 위해 다음 dependency를 추가했습니다.
+
+```text
+pgvector>=0.5.0
+psycopg[binary]>=3.3.5
+```
+
+`psycopg`는 Python과 PostgreSQL의 연결을 담당합니다. `pgvector` Python package는
+다음 import를 통해 PostgreSQL Connection에 Vector 타입 adapter를 등록하고,
+NumPy Vector를 pgvector 타입으로 전달할 수 있게 합니다.
+
+```python
+from pgvector.psycopg import register_vector
+```
+
+PostgreSQL password는 코드나 README에 저장하지 않고 Git에서 제외된 로컬 `.env`
+환경변수에서 읽습니다.
+
+#### SQL Schema
+
+버전 관리 가능한 [SQL schema](sql/001_create_rag_chunks.sql)에 `rag_chunks`
+Table을 정의했습니다.
+
+```text
+rag_chunks
+├── id: BIGSERIAL PRIMARY KEY
+├── document_name: TEXT
+├── chunk_id: INTEGER
+├── page_number: INTEGER
+├── content: TEXT
+├── embedding: VECTOR(384)
+├── embedding_model: TEXT
+├── chunk_size: INTEGER
+└── chunk_overlap: INTEGER
+```
+
+Embedding은 `VECTOR(384) NOT NULL`로 저장하여 기존 모델의 실제 384차원 출력과
+schema가 일치하도록 했습니다.
+
+#### metadata를 함께 저장한 이유
+
+Embedding만 별도로 저장하지 않고 원문과 출처 정보를 같은 행에서 관리합니다.
+
+```text
+Chunk Vector
+↕
+chunk_id
+page_number
+content
+document_name
+chunking 설정
+embedding model
+```
+
+향후 Vector Search로 가까운 Embedding을 찾았을 때 원문 text와 page metadata를
+함께 조회하여 RAG Context와 Source로 사용할 수 있기 때문입니다.
+
+#### Upsert와 idempotency
+
+Upsert는 데이터가 없으면 INSERT하고, 이미 있으면 UPDATE하는 방식입니다.
+
+```text
+없으면
+→ INSERT
+
+이미 있으면
+→ UPDATE
+```
+
+다음 조합을 UNIQUE constraint로 만들어 동일 dataset 행을 식별했습니다.
+
+```text
+document_name
+chunk_id
+embedding_model
+chunk_size
+chunk_overlap
+```
+
+INSERT에는 `ON CONFLICT ... DO UPDATE`를 사용하여 충돌 시 `page_number`, `content`,
+`embedding`을 갱신합니다.
+
+Idempotency는 같은 작업을 여러 번 실행해도 최종 DB 상태가 불필요하게 달라지지
+않는 성질입니다. 실제 실행 결과는 다음과 같았습니다.
+
+```text
+첫 번째 실행
+→ 162 rows
+
+두 번째 실행
+→ 162 rows
+```
+
+단순 INSERT에서 생길 수 있는 `162 → 324` 중복 적재가 발생하지 않았습니다.
+이는 모든 데이터 파이프라인의 완전한 idempotency를 증명한 것이 아니라, 현재
+baseline dataset과 UNIQUE key를 기준으로 재실행 안전성을 확인한 결과입니다.
+
+#### 실제 적재 검증 결과
+
+```text
+생성된 Chunk 수: 162
+Embedding shape: (162, 384)
+pgvector version: 0.8.6
+Upsert 처리 행 수: 162
+
+DB Row count: 162
+NULL 행 수: 0
+Embedding dimension: 384 / 384
+Chunk ID 범위: 1 / 162
+```
+
+- **Row count**: Python에서 생성한 Chunk 수와 DB 저장 행 수가 일치하는지 확인
+- **NULL**: 필수 metadata, content 및 embedding의 누락 여부 확인
+- **vector_dims**: 모든 Embedding이 schema의 384차원과 일치하는지 확인
+- **Chunk ID**: baseline Chunk가 실제 생성 범위인 1~162로 저장됐는지 확인
+
+Embedding 전체 숫자는 출력하지 않고 첫 3개 행의 `chunk_id`, `page_number`,
+content preview와 Vector dimension만 확인했습니다.
+
+#### Persistence 검증
+
+PostgreSQL Container를 재시작한 뒤에도 다음 상태가 유지됐습니다.
+
+```text
+Container: healthy
+rag_chunks baseline rows: 162
+```
+
+메모리에서 다시 구성하는 기존 FAISS Index와 달리, Chunk와 Embedding이 PostgreSQL
+named volume에 영속 저장됐음을 Container 재시작 수준에서 확인했습니다. Volume
+삭제와 복구까지 시험한 것은 아닙니다.
+
+#### FAISS와 현재 저장 구조의 차이
+
+기존 FAISS baseline:
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+FAISS Index
+↓
+Memory
+```
+
+현재 pgvector 저장 단계:
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+PostgreSQL
+↓
+Persistent Storage
+```
+
+FAISS는 Vector Search에 특화된 라이브러리입니다. PostgreSQL + pgvector는 일반
+데이터와 Vector를 DB에서 함께 관리하고 영속 저장할 수 있다는 차이가 있으며,
+FAISS가 잘못된 기술이라는 의미는 아닙니다.
+
+#### 아직 수행하지 않은 작업
+
+- Query Embedding을 이용한 SQL Vector Search
+- `<=>` 기반 Top-K Retrieval
+- pgvector Retrieval 함수
+- FAISS와 pgvector 검색 결과 비교
+- Vector index인 HNSW 및 IVFFlat
+- OpenAI 및 Ollama Generation 연결
+- FastAPI
+- LangChain
+
+#### 실행 방법
+
+실제 비밀번호를 명령에 직접 작성하지 않고 `.env`를 현재 shell의 환경변수로
+불러온 뒤 실행합니다. `.env`는 Git에 포함하지 않습니다.
+
+```bash
+set -a
+source .env
+set +a
+
+uv run python -m rag_basic.pgvector_ingest
+```
+
+#### 다음 단계
+
+다음 단계는 **SQL Vector Search 구현**입니다.
+
+```text
+User Query
+↓
+Query Embedding
+↓
+PostgreSQL
+↓
+ORDER BY embedding <=> query_embedding
+↓
+Top-5 Chunk
+```
+
+현재는 Chunk와 Embedding 적재까지 완료했으며 SQL 검색은 아직 구현하지 않았습니다.
 
 ## 진행 상황
 
@@ -1504,7 +1743,7 @@ PostgreSQL + pgvector
 - [ ] 추가 Retrieval 개선
 - [x] Docker 환경 구성
 - [x] PostgreSQL + pgvector 실행
-- [ ] Chunk + Embedding DB 적재
+- [x] Chunk + Embedding DB 적재
 - [ ] SQL Vector Search
 - [ ] FAISS vs pgvector 비교
 
