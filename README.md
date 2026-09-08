@@ -1300,6 +1300,191 @@ Chunk Size를 무조건 작게 또는 크게 만드는 것이 목적은 아닙�
 uv run python -m rag_basic.chunk_size_experiment
 ```
 
+## 10. Vector DB
+
+### Docker + PostgreSQL + pgvector 환경 구성
+
+현재 RAG는 FAISS를 사용해 다음 흐름으로 Vector Search를 수행합니다.
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+FAISS Index
+↓
+Vector Search
+```
+
+FAISS는 현재 실험에서 정상적으로 동작하지만, 프로그램을 실행할 때마다 Chunk
+Embedding과 Index를 메모리에 다시 구성하는 구조입니다. 이번 확장에서는 Chunk,
+metadata와 Embedding을 PostgreSQL에 영속적으로 저장하고 SQL 기반 Vector
+Search를 구현하기 위한 기반 환경을 만들었습니다.
+
+이는 FAISS가 잘못된 방식이어서 교체하는 것이 아니라, 영속 저장과 데이터 관리가
+가능한 Vector DB 구조를 추가로 학습하기 위한 확장입니다.
+
+#### PostgreSQL과 pgvector
+
+PostgreSQL은 일반적인 SQL 데이터를 저장하고 조회할 수 있는 관계형 DBMS입니다.
+pgvector extension을 추가하면 PostgreSQL 안에서 Vector 타입과 Vector 거리
+연산도 사용할 수 있습니다.
+
+앞으로 하나의 DB Table에서 다음 정보를 관리할 예정입니다.
+
+```text
+chunk_id
+page_number
+text
+embedding
+```
+
+이번 단계에서는 아직 Table이나 Embedding column을 만들지 않았습니다.
+
+pgvector는 별도의 DB가 아니라 PostgreSQL에 Vector 기능을 추가하는 extension입니다.
+다음 SQL로 extension을 활성화했습니다.
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+실제 환경에서 PostgreSQL `16.15`와 pgvector `0.8.6`이 동작하는 것을
+확인했습니다.
+
+#### Docker를 사용한 이유
+
+PostgreSQL과 pgvector를 Ubuntu host에 직접 설치하지 않고 Docker Container에서
+실행했습니다.
+
+- DB 실행 환경을 host와 분리
+- 동일한 설정을 다시 구성하기 쉬움
+- Container를 다시 생성해도 named volume으로 데이터 보존 가능
+- 프로젝트 실행 설정을 `compose.yaml`로 관리 가능
+
+#### 생성된 파일
+
+```text
+rag-basic/
+├── compose.yaml
+├── .env.example
+└── docker/
+    └── postgres/
+        └── init.sql
+```
+
+- `compose.yaml`: PostgreSQL + pgvector Container 실행 설정
+- `.env.example`: 실행에 필요한 DB 환경변수 예시
+- `docker/postgres/init.sql`: 최초 DB 초기화 시 vector extension 활성화
+
+실제 `.env`는 로컬 실행용 설정 파일이며 `.gitignore`로 제외합니다. 실제 DB
+password는 Git과 README에 저장하지 않습니다.
+
+#### Docker 구성
+
+- Image: `pgvector/pgvector:pg16`
+- Container: `rag-postgres`
+- Host port: `5432`
+- Container port: `5432`
+- Named volume: `rag-basic_postgres_data`
+- PostgreSQL 준비 상태를 확인하는 healthcheck 사용
+- `unless-stopped` restart policy 사용
+
+#### 검증 결과
+
+```text
+Container: rag-postgres
+Status: healthy
+PostgreSQL: 16.15
+pgvector: 0.8.6
+Volume: rag-basic_postgres_data
+```
+
+Vector 타입이 활성화됐는지 다음 SQL로 확인했습니다.
+
+```sql
+SELECT '[1,2,3]'::vector;
+```
+
+정상적으로 다음 Vector가 반환됐습니다.
+
+```text
+[1,2,3]
+```
+
+pgvector의 cosine distance 연산도 확인했습니다.
+
+```sql
+SELECT
+    '[1,0,0]'::vector <=> '[1,0,0]'::vector,
+    '[1,0,0]'::vector <=> '[0,1,0]'::vector;
+```
+
+- 같은 방향 Vector의 distance: `0`
+- 서로 직교하는 Vector의 distance: `1`
+
+#### Cosine distance
+
+`<=>`는 pgvector의 cosine distance 연산자이며, 값이 작을수록 두 Vector의 방향이
+더 비슷하다는 뜻입니다.
+
+```text
+같은 Vector
+→ distance 0
+
+서로 직교하는 Vector
+→ distance 1
+```
+
+Cosine similarity와 cosine distance는 해석 방향이 반대입니다.
+
+```text
+Cosine similarity
+→ 높을수록 유사
+
+Cosine distance
+→ 낮을수록 유사
+```
+
+#### Volume의 의미
+
+PostgreSQL 데이터는 Container 자체가 아니라 Docker named volume인
+`rag-basic_postgres_data`에 저장됩니다. Container를 `docker compose restart`로
+재시작한 뒤에도 vector extension `0.8.6`이 유지되는 것을 확인했습니다.
+
+이는 Container 재시작 수준의 확인이며, Volume 삭제와 복구까지 검증한 실험은
+아닙니다.
+
+#### 아직 수행하지 않은 작업
+
+- chunks Table 생성
+- Embedding column 생성
+- Python에서 PostgreSQL 연결
+- PDF 및 Chunk 적재
+- Embedding 적재
+- SQL Vector Search
+- FAISS와 pgvector 비교
+- FastAPI
+- LangChain
+
+#### 다음 단계
+
+다음 단계는 **Chunk + Embedding PostgreSQL 적재**입니다.
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+PostgreSQL + pgvector
+```
+
+현재는 PostgreSQL + pgvector 실행 환경까지만 구성했으며, 데이터 적재는 아직
+구현하지 않았습니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -1317,6 +1502,11 @@ uv run python -m rag_basic.chunk_size_experiment
 - [x] Reranking 비교
 - [x] Chunking configuration 비교
 - [ ] 추가 Retrieval 개선
+- [x] Docker 환경 구성
+- [x] PostgreSQL + pgvector 실행
+- [ ] Chunk + Embedding DB 적재
+- [ ] SQL Vector Search
+- [ ] FAISS vs pgvector 비교
 
 ## AI 도구 활용
 
