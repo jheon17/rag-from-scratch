@@ -1941,6 +1941,238 @@ uv run python -m rag_basic.pgvector_retrieval
        rank / chunk / score 비교
 ```
 
+### FAISS vs pgvector 비교
+
+이번 실험은 FAISS와 pgvector 중 어느 기술이 더 좋은지 판단하기 위한 것이
+아닙니다. 기존 FAISS Retrieval을 PostgreSQL + pgvector backend로 변경해도,
+동일한 Vector와 cosine 기준의 exact search 조건에서 Retrieval 결과가 유지되는지
+검증하는 것이 목적입니다.
+
+비교를 재현하는 코드는
+`src/rag_basic/faiss_pgvector_comparison.py`에 구현했습니다.
+
+#### 공정한 비교 조건
+
+PostgreSQL에 저장된 Document Embedding을 읽어 FAISS에서도 그대로 사용했습니다.
+
+```text
+PostgreSQL rag_chunks
+        ↓
+동일 Document Embeddings
+        ↓
+   ┌────┴────┐
+   ↓         ↓
+ FAISS    pgvector
+```
+
+FAISS용 Document Embedding을 별도로 계산하거나 다시 정규화하지 않아, Embedding
+재계산에 따른 차이를 비교 변수에서 제외했습니다.
+
+```text
+shape: (162, 384)
+dtype: float32
+
+norm min: 0.99999994
+norm max: 1.00000012
+norm average: 1.00000000
+```
+
+기존에 정규화한 E5 Embedding이 DB에 저장된 뒤에도 L2 norm 약 1을 유지하는 것을
+확인했습니다.
+
+각 Evaluation Case에서는 Query Embedding도 정확히 한 번만 생성하고, 같은 Query
+Vector를 두 backend에 전달했습니다. 모든 Query Vector의 norm도 약 1.0이었습니다.
+
+```text
+Query
+↓
+Query Embedding 1회
+↓
+├─ FAISS
+└─ pgvector
+```
+
+#### 검색 방식
+
+FAISS는 정규화된 Vector를 `IndexFlatIP`로 검색했습니다. 두 Vector의 norm이 1이면
+Inner Product를 cosine similarity로 해석할 수 있으며, score가 높을수록
+유사합니다.
+
+pgvector는 `<=>` 연산자로 cosine distance를 계산합니다. Distance는 낮을수록
+유사하며, 비교용 score는 다음과 같이 cosine similarity로 변환했습니다.
+
+```text
+cosine similarity = 1 - cosine distance
+```
+
+이번 실험의 FAISS `IndexFlatIP`와 index가 없는 pgvector 검색은 모두 approximate
+search가 아니라 전체 후보를 비교하는 exact search입니다.
+
+#### Top-5 비교 결과
+
+기존 평가셋의 in-domain Case 6개에서 Top-5 `chunk_id`의 순서와 집합을 각각
+비교했습니다.
+
+```text
+Exact Top-5 order match: 6/6
+Top-5 set match: 6/6
+```
+
+| Case | FAISS Top-5 | pgvector Top-5 | First gold rank | RR |
+| --- | --- | --- | ---: | ---: |
+| `copyright_in_domain` | `[28, 39, 3, 93, 35]` | `[28, 39, 3, 93, 35]` | 1 | 1.0000 |
+| `creative_contribution_copyright` | `[28, 39, 30, 33, 31]` | `[28, 39, 30, 33, 31]` | 4 | 0.2500 |
+| `ai_assignment_submission` | `[69, 68, 76, 70, 75]` | `[69, 68, 76, 70, 75]` | 1 | 1.0000 |
+| `midjourney_contest_controversy` | `[65, 74, 76, 53, 93]` | `[65, 74, 76, 53, 93]` | 1 | 1.0000 |
+| `fake_news_damage_report` | `[104, 99, 105, 7, 8]` | `[104, 99, 105, 7, 8]` | 1 | 1.0000 |
+| `generative_ai_work_benefits` | `[137, 13, 78, 138, 16]` | `[137, 13, 78, 138, 16]` | 1 | 1.0000 |
+
+기존 gold evidence로 backend별 Retrieval 지표도 다시 계산했습니다.
+
+```text
+FAISS
+Hit@5: 6/6
+MRR: 0.8750
+
+pgvector
+Hit@5: 6/6
+MRR: 0.8750
+```
+
+두 결과 모두 기존 FAISS baseline과 일치했습니다.
+
+#### Score 차이
+
+FAISS의 Inner Product score와 pgvector의 distance를 similarity로 변환한 score를
+같은 순위의 동일 Chunk끼리 비교했습니다.
+
+```text
+maximum absolute difference: 0.0000001747
+average absolute difference: 0.0000000474
+```
+
+모든 score 비교는 `atol=1e-5`, `rtol=1e-5` 범위에서 일치했습니다. 이는 score가
+수학적으로 완전히 동일하다는 뜻이 아니라, 두 구현의 부동소수점 계산 차이
+범위에서 일치했다는 의미입니다.
+
+#### 실험 해석
+
+```text
+기존 FAISS Retrieval
+↓
+PostgreSQL + pgvector Retrieval로 확장
+↓
+현재 baseline에서 Top-5 / Hit@5 / MRR 유지 확인
+```
+
+기존 FAISS Retrieval의 검색 품질을 유지하면서 PostgreSQL 기반의 Embedding 영속
+저장, metadata filtering, SQL Vector Search 구조로 확장했습니다.
+
+다만 이는 다음 조건에서 얻은 결과에 한정됩니다.
+
+```text
+162개 baseline Chunk
+multilingual-e5-small
+384 dimensions
+normalized Vector
+Top-K=5
+exact search
+6개 in-domain Evaluation Case
+```
+
+이번 실험은 pgvector가 FAISS보다 정확하거나 빠르다는 것을 확인한 것이 아닙니다.
+또한 모든 dataset에서 같은 결과를 반환하는지, production 환경에서 어느 쪽이 더
+우수한지, 대규모 dataset에서 검색 성능이 어떤지도 검증하지 않았습니다.
+
+#### Vector DB 단계의 현재 구조
+
+```text
+PDF
+↓
+Chunk
+↓
+Embedding
+↓
+PostgreSQL + pgvector
+↓
+Persistent Vector Storage
+
+User Query
+↓
+Query Embedding
+↓
+SQL Vector Search
+↓
+Top-K Chunk
+↓
+build_context()
+```
+
+검색 backend 비교 결과는 다음과 같습니다.
+
+```text
+FAISS exact search
+        ↕
+pgvector exact search
+
+Top-5 order: 6/6 일치
+Hit@5: 동일
+MRR: 동일
+```
+
+#### 아직 수행하지 않은 작업
+
+- pgvector Retrieval + LLM Generation 최종 연결
+- FastAPI
+- `/ingest`
+- `/query`
+- HNSW 및 IVFFlat
+- 대규모 성능 benchmark
+- LangChain
+
+HNSW와 IVFFlat은 현재 162개 dataset의 exact search에 필수적이지 않으므로 Vector
+DB 단계의 완료 조건으로 두지 않았습니다.
+
+#### 실행 방법
+
+실제 password는 README에 기록하지 않고, Git에서 제외된 `.env`를 현재 shell의
+환경변수로 불러옵니다.
+
+```bash
+set -a
+source .env
+set +a
+
+uv run python -m rag_basic.faiss_pgvector_comparison
+```
+
+#### 다음 단계: 11. 서비스화
+
+다음 단계에서는 아직 구현하지 않은 FastAPI endpoint를 구성할 수 있습니다.
+
+```text
+FastAPI
+
+POST /ingest
+POST /query
+```
+
+향후 목표 구조는 다음과 같습니다.
+
+```text
+Query
+↓
+FastAPI
+↓
+pgvector Retrieval
+↓
+Context
+↓
+OpenAI / qwen3:8b
+↓
+Answer + Source
+```
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -1962,7 +2194,10 @@ uv run python -m rag_basic.pgvector_retrieval
 - [x] PostgreSQL + pgvector 실행
 - [x] Chunk + Embedding DB 적재
 - [x] SQL Vector Search
-- [ ] FAISS vs pgvector 비교
+- [x] FAISS vs pgvector 비교
+- [ ] FastAPI 서비스화
+- [ ] `/ingest`
+- [ ] `/query`
 
 ## AI 도구 활용
 
