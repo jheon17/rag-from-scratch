@@ -3640,18 +3640,169 @@ Retrieval 지표가 유지돼도 최종 Generation 품질이 자동으로 보장
 또한 단순히 답변이 비어 있지 않거나 Citation이 존재한다는 사실만으로 RAG 답변
 품질을 충분히 평가하기 어렵다는 점을 실제 Case에서 확인했습니다.
 
-### 다음 단계: Local LLM Generation 재현성 및 실패 원인 분석
+### Local LLM Generation 변동성 Baseline
 
-다음 12-2B 단계에서는 먼저 다음 항목을 확인할 예정입니다.
+명시적인 Generation 설정을 추가하기 전에 동일한 서비스 입력을 반복했을 때
+답변이 실제로 달라지는지 확인했습니다. 현재 `local_llm.py`의 Ollama 요청에는
+`temperature`와 `seed`가 명시되어 있지 않습니다.
 
-- 동일 질문 반복 실행
-- Generation output 변동 확인
-- Ollama sampling 설정 확인
-- 재현 가능한 Generation 설정 검토
+이번 결과만으로 temperature, seed 또는 `qwen3:8b` 자체가 변동의 원인이라고
+단정하지 않습니다. 이 단계의 목적은 현재 설정에서 출력 변동이 관찰되는지를 먼저
+측정하는 것입니다.
 
-이 확인 후에도 같은 실패가 유지될 경우에만 Prompt를 최소 수정하고 변경 전후
-결과를 비교할 예정입니다. 아직 temperature, seed 또는 Prompt를 변경한 상태는
-아닙니다.
+#### 평가 구조
+
+Generation 함수를 직접 호출하지 않고 다음 최종 서비스 경로 전체를 반복
+호출했습니다.
+
+```text
+generation_stability.py
+↓
+POST /query
+↓
+FastAPI
+↓
+PostgreSQL + pgvector
+↓
+Context
+↓
+Ollama
+↓
+qwen3:8b
+↓
+HTTP Response
+```
+
+기존 Evaluation Case에서 다음 세 질문을 선택하고 각각 5회씩, 총 15회 HTTP
+요청을 실행했습니다.
+
+- `copyright_in_domain`: 기존 정상 동작 control
+- `ai_assignment_submission`: 이전 Generation 실패 Case
+- `fake_news_damage_report`: 이전 Generation 실패 Case
+
+새 질문이나 gold evidence를 만들지 않았습니다.
+
+#### Retrieval 결과
+
+각 Case 안에서 Top-5 Retrieval 결과는 5회 모두 같았습니다.
+
+```text
+copyright_in_domain
+[28, 39, 3, 93, 35]
+
+ai_assignment_submission
+[69, 68, 76, 70, 75]
+
+fake_news_damage_report
+[104, 99, 105, 7, 8]
+```
+
+세 Case 모두 Retrieval variants는 `1`이었습니다. 따라서 이번 반복에서는
+Retrieval 결과의 변동이 관찰되지 않았습니다.
+
+#### copyright_in_domain 결과
+
+```text
+HTTP success: 5/5
+Retrieval variants: 1
+Unique answer count: 5
+Exact refusal: 0/5
+Citation present: 5/5
+```
+
+5회 모두 질문에 답하고 Citation을 생성했지만, exact string 기준으로 답변 문자열은
+모두 달랐습니다. 일부 Run은 Source 1만 사용했고 다른 Run은 여러 Source를
+사용했습니다. 이 차이를 자동으로 semantic quality 차이라고 판정하지는 않습니다.
+
+#### ai_assignment_submission 결과
+
+```text
+HTTP success: 5/5
+Retrieval variants: 1
+Unique answer count: 3
+Exact refusal: 0/5
+Citation present: 5/5
+```
+
+Retrieval Top-5와 Context는 5회 동안 같았지만 Generation 결과는 달랐습니다.
+Run 1~3은 질문을 반복한 뒤 다음 refusal 문구를 포함했습니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+Run 4에서는 검색된 근거를 이용하여 그대로 과제로 제출해서는 안 되며 보조적으로
+활용하고 최종 과제는 학습자가 완성해야 한다는 취지로 직접 답했습니다. Run 5도
+refusal 문구를 포함했지만 질문과 Citation 등의 문자열이 함께 있었습니다.
+
+현재 exact refusal은 답변 전체가 다음 문장과 정확히 같을 때만 `True`입니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+예를 들어 `제공된 문서에서 확인할 수 없습니다. [Source 1]`처럼 Citation이 붙거나
+질문 문장과 refusal이 함께 출력되면 exact refusal에 포함되지 않습니다. 따라서
+이 Case의 `Exact refusal: 0/5`는 거절 취지의 답변이 없었다는 뜻이 아닙니다. 이번
+baseline에서는 기존 metric을 변경하지 않았습니다.
+
+#### fake_news_damage_report 결과
+
+```text
+HTTP success: 5/5
+Retrieval variants: 1
+Unique answer count: 4
+Exact refusal: 0/5
+Citation present: 5/5
+```
+
+이전 12-2A의 단일 실행에서는 지정된 문장으로 거절했지만, 이번 5회 반복에서는
+모두 검색된 근거를 이용해 신고·상담 관련 답변을 생성했습니다. 따라서 한 번의
+Generation 결과만으로 이 Case의 답변 행동을 대표하기 어렵다는 점이
+관찰됐습니다.
+
+#### 전체 결과
+
+| Case | Retrieval variants | Unique answers | Exact refusal | Citation |
+| --- | ---: | ---: | ---: | ---: |
+| copyright_in_domain | 1 | 5 | 0/5 | 5/5 |
+| ai_assignment_submission | 1 | 3 | 0/5 | 5/5 |
+| fake_news_damage_report | 1 | 4 | 0/5 | 5/5 |
+
+이번 실험에서는 동일 질문, 동일 Retrieval Top-5와 동일 Context 조건에서도
+Generation answer 문자열이 여러 형태로 달라지는 현상을 관찰했습니다.
+
+```text
+Retrieval 재현성
+≠ Generation 재현성
+```
+
+따라서 한 번의 Generation 결과만으로 Local RAG의 답변 행동을 평가하면 실험
+결과가 흔들릴 수 있습니다.
+
+#### 해석의 한계
+
+이번 비교는 공백 정규화나 의미 기반 비교가 아닌 exact string comparison만
+사용했습니다. 문장 표현만 조금 다르거나 의미가 사실상 같은 답변도 서로 다른
+variant로 계산됩니다. 따라서 Unique answer count를 의미적으로 서로 다른 답변의
+개수라고 해석할 수 없습니다.
+
+또한 이 실험만으로 변동의 원인을 temperature, seed 또는 모델 자체라고 확정하지
+않습니다.
+
+### 다음 단계: Generation 재현성 설정 비교
+
+다음 12-2B-2 단계에서는 명시적인 `temperature = 0`과 fixed seed 설정을 검토한
+뒤, 동일한 3 Case × 5회 실험을 다시 수행할 예정입니다.
+
+baseline과 다음 항목을 비교합니다.
+
+- Retrieval variants
+- Unique answer count
+- refusal behavior
+- Citation behavior
+
+아직 temperature, seed 또는 Prompt를 변경한 상태는 아닙니다.
 
 ## 진행 상황
 
@@ -3681,7 +3832,8 @@ Retrieval 지표가 유지돼도 최종 Generation 품질이 자동으로 보장
 - [x] Document-aware `/query`
 - [x] pgvector Retrieval + qwen3:8b Generation
 - [x] 최종 RAG API Evaluation Baseline
-- [ ] Local LLM Generation 재현성 및 실패 원인 분석
+- [x] Local LLM Generation 변동성 Baseline
+- [ ] Generation 재현성 설정 비교
 
 ## AI 도구 활용
 
