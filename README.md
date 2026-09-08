@@ -4292,20 +4292,188 @@ Source 1 + Source 2 + Source 4
 → refusal
 ```
 
-### 다음 단계: Source 4 Content Diagnosis
+### Source 4 Content Diagnosis
 
-12-2C-4에서는 다음 내용을 확인할 예정입니다.
+이전 Gold Source Interaction Ablation에서는 다음과 같은 차이가 관찰됐습니다.
 
-- Source 1, Source 2, Source 4의 전체 text와 각 `page_number`
-- Source 4에서 질문과 관련된 문장
-- Source 1과 Source 4의 의미 관계
-- `chunk_id=70`의 앞뒤 인접 Chunk
-- Chunk overlap 여부
-- 문장 경계가 Chunk 사이에서 잘렸는지
+```text
+Source 1 only
+→ 직접 답변
 
-Source 4의 어떤 내용 또는 Chunk 구조가 Generation behavior 변화와 관련 있는지
-확인하는 것이 목적입니다. 아직 Prompt는 수정하지 않으며, Source 4 Content
-Diagnosis도 수행하지 않았습니다.
+Source 1 + Source 2
+→ 직접 답변
+
+Source 1 + Source 4
+→ refusal
+
+Source 1 + Source 2 + Source 4
+→ refusal
+```
+
+12-2C-4에서는 이 결과를 바탕으로 Source 4의 실제 내용과 Chunk 구조를
+조사했습니다. 이번 진단에서도 Prompt는 수정하지 않았습니다.
+
+#### Source 기본 정보
+
+```text
+Source 1 = chunk 69, page 33, 500자
+Source 2 = chunk 68, page 33, 500자
+Source 4 = chunk 70, page 33, 102자
+```
+
+선택된 DB configuration은 다음과 같습니다.
+
+```text
+embedding_model: intfloat/multilingual-e5-small
+chunk_size: 500
+chunk_overlap: 100
+```
+
+#### HTTP와 DB 일관성
+
+```text
+Source 1 HTTP text == DB content: True
+Source 2 HTTP text == DB content: True
+Source 4 HTTP text == DB content: True
+```
+
+따라서 이번 진단은 실제 API Retrieval에서 사용된 text와 DB에 저장된 Chunk
+content가 동일한 상태를 기준으로 수행했습니다.
+
+#### 인접 Chunk overlap
+
+```text
+68 → 69
+exact overlap: 100자
+
+69 → 70
+exact overlap: 100자
+
+70 → 71
+overlap: 0자
+서로 다른 page
+```
+
+설정값 `chunk_overlap=100`과 68→69, 69→70의 실제 중복 구조가 일치했습니다.
+70→71은 서로 다른 페이지이므로 overlap이 0자인 것을 오류로 해석하지 않습니다.
+
+#### Source 4의 핵심 구조
+
+가장 중요한 구조적 결과는 다음과 같습니다.
+
+```text
+Source 4 전체 길이: 102자
+Source 1과 exact overlap: 100자
+Source 4의 non-overlap new portion: 2자
+```
+
+새 부분은 다음 두 글자였습니다.
+
+```text
+요!
+```
+
+즉 Source 4는 다음과 같이 구성됐습니다.
+
+```text
+Source 1의 마지막 100자를 반복
++
+문장 끝의 "요!"
+```
+
+#### 질문 관련 literal 위치
+
+Source 4에서는 다음 위치가 확인됐습니다.
+
+```text
+과제: [46]
+제출: []
+그대로: []
+생성형 AI: [38]
+```
+
+이 질문 관련 표현들은 Source 4의 새로운 2자 부분이 아니라 Source 1과 겹치는
+100자 영역에 존재했습니다. Source 4의 new portion인 `요!`에서는 다음과 같이
+어떤 표현도 발견되지 않았습니다.
+
+```text
+과제: []
+제출: []
+그대로: []
+생성형 AI: []
+```
+
+이는 문장의 의미를 판단한 것이 아니라 literal string의 위치만 확인한
+결과입니다.
+
+#### 핵심 관찰과 해석 제한
+
+Source 4는 새로운 의미 내용을 대량으로 추가하는 Chunk가 아니라 Source 1의
+마지막 100자를 거의 그대로 반복하는 near-duplicate Chunk였습니다. 새롭게
+추가되는 문자열은 `요!` 두 글자뿐이었습니다.
+
+따라서 이전 실험의 `Source 4 포함 → refusal`을 Source 4에 새로운 질문 관련
+정보가 추가됐기 때문이라고 단순하게 설명하기는 어려워졌습니다.
+
+현재 확인된 사실은 다음 범위까지입니다.
+
+```text
+Source 4가 Source 1과 100/102자 중복되는 near-duplicate 구조이며,
+이 Source가 포함된 이전 Condition에서 refusal behavior가 관찰됐다.
+```
+
+아직 중복 Context, `요!` 두 글자, Source 4의 header나 rank, Chunking, Prompt 또는
+`qwen3:8b`가 원인이라고 확정하지 않습니다.
+
+현재까지의 원인 분해는 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Source 1
+→ 직접 답변
+
+Source 1 + Source 2
+→ 직접 답변
+
+Source 1 + Source 4
+→ refusal
+
+Source 4 구조
+→ 102자 중 100자가 Source 1과 중복
+→ 새 부분은 "요!" 2자
+```
+
+따라서 다음에는 Source 4의 새로운 의미 내용보다 near-duplicate Context 자체의
+영향을 분리해서 확인할 필요가 있습니다.
+
+Docker Compose 상태 확인은 현재 환경에서 sudo 대화형 인증이 필요해 직접
+수행하지 못했습니다. Docker 전체 상태를 검증한 것은 아니지만, 5432 포트 연결과
+PostgreSQL read-only `SELECT`는 정상적으로 동작해 이번 진단에 필요한 DB 접근을
+확인했습니다.
+
+### 다음 단계: Duplicate Context Ablation
+
+12-2C-5에서는 다음 조건을 비교할 예정입니다.
+
+```text
+A. Source 1 only
+
+B. Source 1 + Source 4 original
+   - 기존 near-duplicate 102자
+
+C. Source 1 + Source 4 overlap-only
+   - Source 1과 중복되는 100자만
+
+D. Source 1 + Source 4 new-portion-only
+   - "요!"만
+```
+
+refusal behavior 변화가 near-duplicate 100자와 관련 있는지, 새로운 2자 부분과
+관련 있는지를 분리하는 것이 목적입니다. Production Retrieval이나 Chunking을
+변경하지 않고 진단용 synthetic Context를 사용하는 ablation이며, 아직 수행하지
+않았습니다.
 
 ## 진행 상황
 
@@ -4340,7 +4508,8 @@ Diagnosis도 수행하지 않았습니다.
 - [x] Generation 실패 원인 진단
 - [x] Context Ablation
 - [x] Gold Source Interaction Ablation
-- [ ] Source 4 Content Diagnosis
+- [x] Source 4 Content Diagnosis
+- [ ] Duplicate Context Ablation
 
 ## AI 도구 활용
 
