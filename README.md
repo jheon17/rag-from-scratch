@@ -4159,18 +4159,33 @@ Full Top-5
 따라서 다음 단계에서는 gold Source 사이의 상호작용을 더 세분화해 확인할
 필요가 있습니다.
 
-### 다음 단계: Gold Source Interaction Ablation
+### Gold Source Interaction Ablation
 
-12-2C-3에서는 다음 조건을 비교할 예정입니다.
+이전 Context Ablation에서 SOURCE_1_ONLY는 직접 답변했지만 GOLD_ONLY는 refusal
+문구를 포함했습니다. 12-2C-3에서는 gold Source 중 어떤 Source가 Source 1에
+추가될 때 refusal behavior가 달라지는지 더 세분화해 확인했습니다.
+
+Generation 설정은 이전 실험과 동일하게 유지했습니다.
 
 ```text
-A. Source 1 only
-B. Source 1 + Source 2
-C. Source 1 + Source 4
-D. Source 1 + Source 2 + Source 4
+model = qwen3:8b
+temperature = 0
+seed = 42
 ```
 
-현재 Source와 Chunk의 연결은 다음과 같습니다.
+#### 실제 Retrieval
+
+실제 `/query`에서 확인한 Top-5는 다음과 같습니다.
+
+```text
+rank=1, chunk_id=69, gold=True
+rank=2, chunk_id=68, gold=True
+rank=3, chunk_id=76, gold=False
+rank=4, chunk_id=70, gold=True
+rank=5, chunk_id=75, gold=False
+```
+
+따라서 interaction 대상은 다음 세 Source였습니다.
 
 ```text
 Source 1 = chunk 69
@@ -4178,10 +4193,119 @@ Source 2 = chunk 68
 Source 4 = chunk 70
 ```
 
-어떤 Source가 Source 1에 추가될 때 refusal behavior가 발생하는지 분리하는 것이
-목적입니다. 또한 HTTP response의 Context와 동일 Retrieval result로 재구성한
-Context가 exact string으로 같은지, 최종 Prompt도 동일한지 확인할 예정입니다.
-이 실험은 아직 수행하지 않았습니다.
+#### HTTP와 Direct 입력 일관성
+
+HTTP 응답의 Context와 동일한 Retrieval 결과로 재구성한 Context를 exact
+string으로 비교했습니다. 두 Context로 생성한 Prompt도 같은 방식으로
+비교했습니다.
+
+```text
+HTTP context length: 2197
+rebuilt context length: 2197
+HTTP context == rebuilt context: True
+
+HTTP-derived prompt length: 2467
+rebuilt prompt length: 2467
+HTTP-derived prompt == rebuilt prompt: True
+```
+
+따라서 이전 HTTP/direct answer 차이를 Context 또는 Prompt 문자열 차이만으로는
+설명할 수 없습니다. 이 결과만으로 다른 원인을 자동으로 확정하지는 않습니다.
+
+#### 비교 조건
+
+다음 네 Condition을 각각 세 번 반복했습니다.
+
+```text
+SOURCE_1_ONLY
+Source [1]
+chunk [69]
+
+SOURCE_1_PLUS_2
+Source [1, 2]
+chunk [69, 68]
+
+SOURCE_1_PLUS_4
+Source [1, 4]
+chunk [69, 70]
+
+SOURCE_1_PLUS_2_PLUS_4
+Source [1, 2, 4]
+chunk [69, 68, 70]
+```
+
+| Condition | Source | NO_ANSWER 포함 | Unique answers | Citation 유효 |
+| --- | --- | ---: | ---: | ---: |
+| SOURCE_1_ONLY | `[1]` | 0/3 | 1 | 3/3 |
+| SOURCE_1_PLUS_2 | `[1, 2]` | 0/3 | 1 | 3/3 |
+| SOURCE_1_PLUS_4 | `[1, 4]` | 3/3 | 1 | 3/3 |
+| SOURCE_1_PLUS_2_PLUS_4 | `[1, 2, 4]` | 3/3 | 1 | 3/3 |
+
+#### 핵심 관찰
+
+```text
+Source 2 추가
+→ refusal behavior 차이가 관찰되지 않음
+
+Source 4 추가
+→ refusal behavior 차이가 관찰됨
+
+Source 2와 Source 4 모두 추가
+→ refusal behavior 차이가 관찰됨
+```
+
+현재 실행 환경과 이 Case에서는 Source 4가 포함된 Condition에서 refusal behavior가
+반복적으로 관찰됐습니다.
+
+관찰된 사실은 Source 4 포함 여부와 refusal behavior 사이에 차이가 있었다는
+점입니다. 아직 다음 중 무엇이 실제 원인인지는 확인하지 않았습니다.
+
+```text
+chunk 70 자체
+chunk 70의 특정 문장
+Source 간 의미 충돌
+Chunk overlap
+문장 경계
+Prompt
+qwen3:8b
+Context 길이
+```
+
+따라서 현재 결과만으로 `chunk 70이 문제다`라고 확정하지 않습니다.
+
+현재까지의 원인 분해는 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Source 1 only
+→ 직접 답변
+
+Source 1 + Source 2
+→ 직접 답변
+
+Source 1 + Source 4
+→ refusal
+
+Source 1 + Source 2 + Source 4
+→ refusal
+```
+
+### 다음 단계: Source 4 Content Diagnosis
+
+12-2C-4에서는 다음 내용을 확인할 예정입니다.
+
+- Source 1, Source 2, Source 4의 전체 text와 각 `page_number`
+- Source 4에서 질문과 관련된 문장
+- Source 1과 Source 4의 의미 관계
+- `chunk_id=70`의 앞뒤 인접 Chunk
+- Chunk overlap 여부
+- 문장 경계가 Chunk 사이에서 잘렸는지
+
+Source 4의 어떤 내용 또는 Chunk 구조가 Generation behavior 변화와 관련 있는지
+확인하는 것이 목적입니다. 아직 Prompt는 수정하지 않으며, Source 4 Content
+Diagnosis도 수행하지 않았습니다.
 
 ## 진행 상황
 
@@ -4215,7 +4339,8 @@ Context가 exact string으로 같은지, 최종 Prompt도 동일한지 확인할
 - [x] Generation 재현성 설정 비교
 - [x] Generation 실패 원인 진단
 - [x] Context Ablation
-- [ ] Gold Source Interaction Ablation
+- [x] Gold Source Interaction Ablation
+- [ ] Source 4 Content Diagnosis
 
 ## AI 도구 활용
 
