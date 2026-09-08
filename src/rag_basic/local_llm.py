@@ -7,6 +7,8 @@ from urllib.request import Request, urlopen
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 LOCAL_MODEL_NAME = "qwen3:8b"
+LOCAL_TEMPERATURE = 0
+LOCAL_SEED = 42
 TEST_PROMPT = "RAG에서 Retrieval이 필요한 이유를 두 문장으로 설명해줘."
 
 
@@ -21,6 +23,10 @@ def generate_local_answer(prompt: str) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "think": False,
+        "options": {
+            "temperature": LOCAL_TEMPERATURE,
+            "seed": LOCAL_SEED,
+        },
     }
     request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(

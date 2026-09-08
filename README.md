@@ -3790,19 +3790,155 @@ variant로 계산됩니다. 따라서 Unique answer count를 의미적으로 서
 또한 이 실험만으로 변동의 원인을 temperature, seed 또는 모델 자체라고 확정하지
 않습니다.
 
-### 다음 단계: Generation 재현성 설정 비교
+### Generation 재현성 설정 비교
 
-다음 12-2B-2 단계에서는 명시적인 `temperature = 0`과 fixed seed 설정을 검토한
-뒤, 동일한 3 Case × 5회 실험을 다시 수행할 예정입니다.
+`local_llm.py`에 다음 Generation 설정을 명시했습니다.
 
-baseline과 다음 항목을 비교합니다.
+```python
+LOCAL_TEMPERATURE = 0
+LOCAL_SEED = 42
+```
 
-- Retrieval variants
-- Unique answer count
-- refusal behavior
-- Citation behavior
+Ollama 요청에는 다음과 같이 숫자 값으로 전달합니다.
 
-아직 temperature, seed 또는 Prompt를 변경한 상태는 아닙니다.
+```python
+"options": {
+    "temperature": LOCAL_TEMPERATURE,
+    "seed": LOCAL_SEED,
+}
+```
+
+`temperature = 0`은 sampling의 무작위성을 낮추기 위한 설정이고, fixed seed `42`는
+동일한 조건에서 반복 비교할 때 재현성을 높이기 위한 설정입니다. 기존
+`qwen3:8b`, `stream = False`, `think = False`, timeout 및 `LocalLLMError` 처리는
+유지했습니다.
+
+이 설정이 모든 시스템, GPU 및 Ollama 버전에서 100% deterministic한 출력을
+보장한다는 의미는 아닙니다. 현재 로컬 실행 환경에서 실제 반복 결과를
+비교했습니다.
+
+#### Local LLM 단독 반복
+
+Retrieval이 없는 동일 TEST_PROMPT를 세 번 실행했습니다.
+
+```text
+3회 answer exact 동일: True
+```
+
+#### 동일 HTTP 반복 실험
+
+기존 `generation_stability.py`를 수정하지 않고 그대로 재사용해 동일한 3 Case ×
+5회, 총 15회 HTTP 요청을 다시 실행했습니다.
+
+```text
+generation_stability.py
+↓
+POST /query
+↓
+FastAPI
+↓
+PostgreSQL + pgvector
+↓
+Context
+↓
+Ollama qwen3:8b
+↓
+HTTP Response
+```
+
+#### Before / After 비교
+
+| Case | Baseline unique answers | Fixed settings unique answers | Retrieval variants | Citation |
+| --- | ---: | ---: | ---: | ---: |
+| copyright_in_domain | 5 | 1 | 1 | 5/5 |
+| ai_assignment_submission | 3 | 1 | 1 | 5/5 |
+| fake_news_damage_report | 4 | 1 | 1 | 5/5 |
+
+세 Case 모두 Retrieval variants가 `1`, fixed settings의 Unique answers가 `1`이
+됐습니다. 현재 환경에서는 명시적인 Generation 설정을 적용한 뒤 exact string
+기준 반복 결과의 재현성이 개선됐습니다.
+
+#### copyright_in_domain 결과
+
+5회 모두 다음 Top-5를 사용했고 Generation answer도 같았습니다.
+
+```text
+Top-5: [28, 39, 3, 93, 35]
+Citation: [Source 1] [Source 2] [Source 5]
+Unique answers: 1
+```
+
+이는 반복 출력이 같았다는 결과입니다. 답변의 법률적 정확성이나 Citation
+faithfulness를 자동으로 보장한 결과는 아닙니다.
+
+#### ai_assignment_submission 결과
+
+5회 모두 다음 Top-5와 같은 답변을 반환했습니다.
+
+```text
+Top-5: [69, 68, 76, 70, 75]
+
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+제공된 문서에서 확인할 수 없습니다. [Source 1]
+```
+
+기존 gold evidence는 Retrieval rank 1에 존재하지만 모델은 이를 적절한 답변으로
+활용하지 못했습니다.
+
+```text
+재현성은 개선
+Generation 품질 문제는 유지
+```
+
+즉 답변이 매번 동일하다는 사실이 답변의 올바름을 의미하지는 않습니다.
+
+```text
+답변이 매번 동일함
+≠ 답변이 올바름
+```
+
+#### fake_news_damage_report 결과
+
+5회 모두 다음 Top-5를 사용하고 같은 신고·상담센터 관련 답변을 생성했습니다.
+
+```text
+Top-5: [104, 99, 105, 7, 8]
+Unique answers: 1
+Citation present: 5/5
+```
+
+12-2A의 단일 실행에서는 refusal이 발생했지만, 설정을 고정한 이번 반복에서는
+하나의 답변으로 고정됐습니다. 이 결과만으로 Prompt quality 문제가 완전히
+해결됐다고 판단하지 않습니다.
+
+#### 세 가지 개념의 구분
+
+```text
+Retrieval 재현성
+Generation 재현성
+Generation 품질
+```
+
+이번 실험에서 Retrieval 결과는 반복해도 고정됐고 Generation 재현성은 설정 전보다
+개선됐습니다. 그러나 assignment Case의 Generation 품질 문제는 계속
+관찰됐습니다.
+
+이번 비교는 exact string 기준이며, 현재 환경에서 수행한 제한된 반복 실험입니다.
+`temperature=0`과 `seed=42`가 모든 환경에서 완전한 determinism을 보장한다고
+일반화할 수 없습니다.
+
+### 다음 단계: Generation 실패 원인 분석
+
+다음 12-2C 단계에서는 우선 `ai_assignment_submission` Case의 다음 내용을
+확인할 예정입니다.
+
+- 실제 Top-5 Context 전체
+- gold Chunk 내용
+- 실제 `build_local_rag_prompt()` 결과
+- 질문, Context 및 Grounding rule 사이의 충돌 여부
+
+아직 Prompt는 수정하지 않습니다. 원인을 먼저 확인한 뒤 최소 Prompt 변경이
+필요한지 결정할 예정입니다.
 
 ## 진행 상황
 
@@ -3833,7 +3969,8 @@ baseline과 다음 항목을 비교합니다.
 - [x] pgvector Retrieval + qwen3:8b Generation
 - [x] 최종 RAG API Evaluation Baseline
 - [x] Local LLM Generation 변동성 Baseline
-- [ ] Generation 재현성 설정 비교
+- [x] Generation 재현성 설정 비교
+- [ ] Generation 실패 원인 분석
 
 ## AI 도구 활용
 
