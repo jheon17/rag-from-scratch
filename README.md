@@ -4453,27 +4453,166 @@ Docker Compose 상태 확인은 현재 환경에서 sudo 대화형 인증이 필
 PostgreSQL read-only `SELECT`는 정상적으로 동작해 이번 진단에 필요한 DB 접근을
 확인했습니다.
 
-### 다음 단계: Duplicate Context Ablation
+### Duplicate Context Ablation
 
-12-2C-5에서는 다음 조건을 비교할 예정입니다.
+이전 Source 4 Content Diagnosis에서 다음 구조를 확인했습니다.
+
+```text
+Source 4 전체 길이 = 102자
+Source 1과 중복 = 100자
+새 부분 = "요!" 2자
+```
+
+12-2C-5에서는 Source 4를 중복 영역과 새 영역으로 나누고, 메모리에서 만든
+synthetic diagnostic Context로 Generation behavior를 비교했습니다. Production
+Retrieval, DB 및 Chunking은 수정하지 않았습니다.
+
+Generation 설정도 그대로 유지했습니다.
+
+```text
+model = qwen3:8b
+temperature = 0
+seed = 42
+```
+
+#### Source 4 분해 결과
+
+```text
+Source 1 length: 500
+Source 4 length: 102
+longest exact overlap: 100
+new portion length: 2
+overlap exact match: True
+```
+
+새 부분은 다음과 같습니다.
+
+```text
+요!
+```
+
+#### 비교 조건
+
+다음 네 조건을 각각 세 번 반복했습니다.
+
+```text
+SOURCE_1_ONLY
+
+SOURCE_1_PLUS_4_ORIGINAL
+- Source 4 original 102자
+
+SOURCE_1_PLUS_4_OVERLAP_ONLY
+- Source 1과 중복되는 100자만 사용
+- synthetic diagnostic Context
+
+SOURCE_1_PLUS_4_NEW_ONLY
+- "요!" 2자만 사용
+- synthetic diagnostic Context
+```
+
+| Condition | NO_ANSWER 포함 | Exact NO_ANSWER | Unique answers | Citation 유효 |
+| --- | ---: | ---: | ---: | ---: |
+| SOURCE_1_ONLY | 0/3 | 0/3 | 1 | 3/3 |
+| SOURCE_1_PLUS_4_ORIGINAL | 2/3 | 0/3 | 2 | 3/3 |
+| SOURCE_1_PLUS_4_OVERLAP_ONLY | 3/3 | 0/3 | 1 | 3/3 |
+| SOURCE_1_PLUS_4_NEW_ONLY | 0/3 | 0/3 | 1 | 3/3 |
+
+#### 핵심 관찰
+
+```text
+Source 1 only
+→ refusal 0/3
+
+Original Source 4
+→ refusal 2/3
+
+Overlap-only 100자
+→ refusal 3/3
+
+New-only "요!"
+→ refusal 0/3
+```
+
+현재 실행에서는 Source 1과 중복되는 100자만 추가한 조건에서 refusal 문구가
+3/3 반복적으로 관찰됐습니다. 반면 새로운 `요!` 두 글자만 추가한 조건에서는
+refusal 문구가 0/3이었습니다.
+
+#### 이전 실험과 Original 비교
+
+이전 Gold Source Interaction Ablation의 SOURCE_1_PLUS_4는 refusal 3/3이었지만,
+이번 SOURCE_1_PLUS_4_ORIGINAL은 2/3이었습니다.
+
+```text
+Previous pattern: 3/3
+Current pattern: 2/3
+same observed pattern: False
+```
+
+따라서 `temperature=0`, `seed=42`를 사용하더라도 모든 반복과 별도 실행에서
+완전한 behavior determinism이 보장된다고 일반화하지 않습니다.
+
+#### 현재 해석과 남은 confound
+
+NEW_ONLY에서 refusal이 0/3이었으므로, Source 4의 새로운 두 글자 `요!`가 refusal
+behavior의 핵심이라는 가설은 약해졌습니다. OVERLAP_ONLY에서는 refusal이
+3/3이었기 때문에 near-duplicate 영역이 포함된 조건과 refusal behavior 사이의
+연관성이 더 강하게 관찰됐습니다. 다만 이를 중복 Context가 원인이라는 결론으로
+확정하지 않습니다.
+
+또한 두 synthetic 조건은 길이가 다릅니다.
+
+```text
+OVERLAP_ONLY = 100자
+NEW_ONLY = 2자
+```
+
+따라서 내용과 추가 text 길이라는 두 변수가 동시에 달라졌습니다. 이번 결과만으로
+중복 여부 자체와 추가 Context 길이의 영향을 완전히 분리했다고 볼 수 없습니다.
+
+현재까지의 원인 분해는 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Source 1 only
+→ 직접 답변
+
+Source 1 + Source 4
+→ refusal behavior 증가
+
+Source 4 구조
+→ 100/102자 near-duplicate
+
+Overlap-only 100자
+→ refusal 3/3
+
+New-only "요!" 2자
+→ refusal 0/3
+```
+
+따라서 다음에는 near-duplicate 여부와 추가 text 길이를 분리하는 length-matched
+control이 필요합니다.
+
+### 다음 단계: Length-Matched Duplicate Control Ablation
+
+12-2C-6에서는 동일한 약 100자의 추가 Context에서 중복 text와 non-duplicate
+text의 behavior를 비교할 예정입니다.
 
 ```text
 A. Source 1 only
 
-B. Source 1 + Source 4 original
-   - 기존 near-duplicate 102자
+B. Source 1 + duplicate 100자
+   - 기존 overlap-only
 
-C. Source 1 + Source 4 overlap-only
-   - Source 1과 중복되는 100자만
-
-D. Source 1 + Source 4 new-portion-only
-   - "요!"만
+C. Source 1 + non-duplicate 100자
+   - 실제 Retrieval Source에서 가져온 Source 1과 exact overlap이 없는 control text
+   - duplicate 조건과 길이를 동일하게 맞춤
 ```
 
-refusal behavior 변화가 near-duplicate 100자와 관련 있는지, 새로운 2자 부분과
-관련 있는지를 분리하는 것이 목적입니다. Production Retrieval이나 Chunking을
-변경하지 않고 진단용 synthetic Context를 사용하는 ablation이며, 아직 수행하지
-않았습니다.
+가능하면 control text는 기존 Retrieval 결과 안에서 가져와 새로운 외부 지식을
+만들지 않습니다. 추가 text 길이는 동일하게 유지하면서 near-duplicate 여부만
+다르게 비교하는 것이 목적이며, 이 실험은 아직 수행하지 않았습니다.
 
 ## 진행 상황
 
@@ -4509,7 +4648,8 @@ refusal behavior 변화가 near-duplicate 100자와 관련 있는지, 새로운 
 - [x] Context Ablation
 - [x] Gold Source Interaction Ablation
 - [x] Source 4 Content Diagnosis
-- [ ] Duplicate Context Ablation
+- [x] Duplicate Context Ablation
+- [ ] Length-Matched Duplicate Control Ablation
 
 ## AI 도구 활용
 
