@@ -116,11 +116,15 @@ def validate_embeddings(chunks: list[dict], embeddings: np.ndarray) -> None:
         )
 
 
-def build_rows(chunks: list[dict], embeddings: np.ndarray) -> list[tuple]:
+def build_rows(
+    document_name: str,
+    chunks: list[dict],
+    embeddings: np.ndarray,
+) -> list[tuple]:
     """Chunk metadata와 대응하는 Vector를 DB INSERT 행으로 구성한다."""
     return [
         (
-            PDF_PATH.name,
+            document_name,
             int(chunk["chunk_id"]),
             int(chunk["page_number"]),
             chunk["text"],
@@ -139,22 +143,43 @@ def ingest_rows(conn: psycopg.Connection, rows: list[tuple]) -> None:
         cursor.executemany(UPSERT_SQL, rows)
 
 
-def dataset_parameters() -> tuple:
-    """현재 baseline dataset을 식별하는 SQL 파라미터를 반환한다."""
-    return (PDF_PATH.name, MODEL_NAME, CHUNK_SIZE, CHUNK_OVERLAP)
+def dataset_parameters(document_name: str) -> tuple:
+    """문서와 Embedding 설정으로 dataset을 식별하는 파라미터를 반환한다."""
+    return (document_name, MODEL_NAME, CHUNK_SIZE, CHUNK_OVERLAP)
+
+
+def count_document_rows(
+    conn: psycopg.Connection, document_name: str
+) -> int:
+    """동일 문서명과 현재 Embedding 설정으로 저장된 행 수를 반환한다."""
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM rag_chunks
+            WHERE document_name = %s
+              AND embedding_model = %s
+              AND chunk_size = %s
+              AND chunk_overlap = %s;
+            """,
+            dataset_parameters(document_name),
+        )
+        return int(cursor.fetchone()[0])
 
 
 def validate_stored_data(
-    conn: psycopg.Connection, chunks: list[dict]
+    conn: psycopg.Connection,
+    document_name: str,
+    chunks: list[dict],
 ) -> dict:
-    """현재 dataset의 행 수, NULL, 차원과 Chunk ID 범위를 검증한다."""
+    """지정한 dataset의 행 수, NULL, 차원과 Chunk ID 범위를 검증한다."""
     filters = """
         document_name = %s
         AND embedding_model = %s
         AND chunk_size = %s
         AND chunk_overlap = %s
     """
-    parameters = dataset_parameters()
+    parameters = dataset_parameters(document_name)
 
     with conn.cursor() as cursor:
         cursor.execute(
@@ -230,8 +255,10 @@ def validate_stored_data(
     return validation
 
 
-def fetch_sample_rows(conn: psycopg.Connection) -> list[tuple]:
-    """현재 dataset의 첫 3개 행에서 Vector 전체를 제외한 정보만 조회한다."""
+def fetch_sample_rows(
+    conn: psycopg.Connection, document_name: str
+) -> list[tuple]:
+    """지정한 dataset의 첫 3개 행에서 Vector를 제외한 정보를 조회한다."""
     with conn.cursor() as cursor:
         cursor.execute(
             """
@@ -244,9 +271,38 @@ def fetch_sample_rows(conn: psycopg.Connection) -> list[tuple]:
             ORDER BY chunk_id
             LIMIT 3;
             """,
-            dataset_parameters(),
+            dataset_parameters(document_name),
         )
         return cursor.fetchall()
+
+
+def ingest_document(
+    conn: psycopg.Connection,
+    model: SentenceTransformer,
+    pdf_path: Path,
+    document_name: str,
+) -> dict:
+    """PDF를 Chunk와 Embedding으로 변환해 지정한 문서명으로 적재한다."""
+    pages, _ = load_pages(pdf_path)
+    chunks = create_chunks(pages)
+    if not chunks:
+        raise ValueError("PDF에서 적재할 텍스트 Chunk를 만들지 못했습니다.")
+
+    chunk_texts = [chunk["text"] for chunk in chunks]
+    embeddings = embed_texts(model, chunk_texts, "passage")
+    embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
+    validate_embeddings(chunks, embeddings)
+
+    rows = build_rows(document_name, chunks, embeddings)
+    ingest_rows(conn, rows)
+    validation = validate_stored_data(conn, document_name, chunks)
+
+    return {
+        "chunks": chunks,
+        "embeddings": embeddings,
+        "upsert_count": len(rows),
+        "validation": validation,
+    }
 
 
 def print_validation(validation: dict, sample_rows: list[tuple]) -> None:
@@ -288,16 +344,7 @@ def main() -> None:
     try:
         database_config = get_database_config()
 
-        pages, _ = load_pages(PDF_PATH)
-        chunks = create_chunks(pages)
-        print(f"생성된 Chunk 수: {len(chunks)}")
-
         model = SentenceTransformer(MODEL_NAME)
-        chunk_texts = [chunk["text"] for chunk in chunks]
-        embeddings = embed_texts(model, chunk_texts, "passage")
-        embeddings = np.ascontiguousarray(embeddings, dtype=np.float32)
-        print(f"Embedding shape: {embeddings.shape}")
-        validate_embeddings(chunks, embeddings)
 
         with psycopg.connect(**database_config) as conn:
             pgvector_version = check_vector_extension(conn)
@@ -307,12 +354,20 @@ def main() -> None:
             apply_schema(conn)
             print("rag_chunks Table 생성 확인: True")
 
-            rows = build_rows(chunks, embeddings)
-            ingest_rows(conn, rows)
-            print(f"Upsert 처리 행 수: {len(rows)}")
+            ingest_result = ingest_document(
+                conn,
+                model,
+                PDF_PATH,
+                PDF_PATH.name,
+            )
+            chunks = ingest_result["chunks"]
+            embeddings = ingest_result["embeddings"]
+            validation = ingest_result["validation"]
+            print(f"생성된 Chunk 수: {len(chunks)}")
+            print(f"Embedding shape: {embeddings.shape}")
+            print(f"Upsert 처리 행 수: {ingest_result['upsert_count']}")
 
-            validation = validate_stored_data(conn, chunks)
-            sample_rows = fetch_sample_rows(conn)
+            sample_rows = fetch_sample_rows(conn, PDF_PATH.name)
             print_validation(validation, sample_rows)
     except (OSError, ValueError, RuntimeError, psycopg.Error) as error:
         print(f"적재 실패: {error}")

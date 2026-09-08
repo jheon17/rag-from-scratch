@@ -1,14 +1,22 @@
 """RAG 서비스화를 위한 최소 FastAPI 서버를 제공한다."""
 
 from functools import lru_cache
+from pathlib import Path
+import tempfile
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pgvector.psycopg import register_vector
 from pydantic import BaseModel, Field
+from pypdf.errors import PdfReadError
 from sentence_transformers import SentenceTransformer
 
+from rag_basic.chunking import CHUNK_OVERLAP, CHUNK_SIZE
 from rag_basic.embedding import MODEL_NAME
+from rag_basic.pgvector_ingest import (
+    count_document_rows,
+    ingest_document,
+)
 from rag_basic.pgvector_retrieval import (
     count_baseline_rows,
     create_query_embedding,
@@ -16,6 +24,10 @@ from rag_basic.pgvector_retrieval import (
     search_pgvector,
 )
 from rag_basic.retrieval import build_context
+
+
+MAX_UPLOAD_SIZE = 20 * 1024 * 1024
+PDF_CONTENT_TYPES = {"application/pdf", "application/x-pdf"}
 
 
 class QueryRequest(BaseModel):
@@ -43,6 +55,17 @@ class QueryResponse(BaseModel):
     top_k: int
     results: list[RetrievalResult]
     context: str
+
+
+class IngestResponse(BaseModel):
+    """업로드한 PDF의 DB 적재 결과 구조다."""
+
+    document_name: str
+    chunk_count: int
+    embedding_dimension: int
+    embedding_model: str
+    chunk_size: int
+    chunk_overlap: int
 
 
 app = FastAPI(
@@ -91,3 +114,81 @@ def query_retrieval(request: QueryRequest) -> QueryResponse:
             status_code=503,
             detail="Retrieval 서비스를 사용할 수 없습니다.",
         ) from None
+
+
+@app.post("/ingest", response_model=IngestResponse)
+def ingest_pdf(file: UploadFile = File(...)) -> IngestResponse:
+    """업로드한 PDF를 임시 파일에서 처리해 pgvector에 적재한다."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="파일명이 필요합니다.")
+
+    document_name = Path(file.filename).name
+    if not document_name or Path(document_name).suffix.lower() != ".pdf":
+        raise HTTPException(
+            status_code=415,
+            detail="PDF 파일만 업로드할 수 있습니다.",
+        )
+    if file.content_type not in PDF_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="PDF content type만 지원합니다.",
+        )
+
+    temporary_path: Path | None = None
+    try:
+        contents = file.file.read(MAX_UPLOAD_SIZE + 1)
+        if len(contents) > MAX_UPLOAD_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail="파일 크기는 20 MiB 이하여야 합니다.",
+            )
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf",
+            delete=False,
+        ) as temporary_file:
+            temporary_file.write(contents)
+            temporary_path = Path(temporary_file.name)
+
+        database_config = get_database_config()
+        with psycopg.connect(**database_config) as conn:
+            register_vector(conn)
+            if count_document_rows(conn, document_name) > 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="동일한 이름의 문서가 이미 적재되어 있습니다.",
+                )
+
+            model = get_embedding_model()
+            ingest_result = ingest_document(
+                conn,
+                model,
+                temporary_path,
+                document_name,
+            )
+
+        embeddings = ingest_result["embeddings"]
+        return IngestResponse(
+            document_name=document_name,
+            chunk_count=len(ingest_result["chunks"]),
+            embedding_dimension=int(embeddings.shape[1]),
+            embedding_model=MODEL_NAME,
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+        )
+    except HTTPException:
+        raise
+    except PdfReadError:
+        raise HTTPException(
+            status_code=400,
+            detail="PDF 파일을 읽을 수 없습니다.",
+        ) from None
+    except (OSError, ValueError, RuntimeError, psycopg.Error):
+        raise HTTPException(
+            status_code=503,
+            detail="문서 적재 서비스를 사용할 수 없습니다.",
+        ) from None
+    finally:
+        file.file.close()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
