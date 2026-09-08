@@ -85,8 +85,9 @@ def search_pgvector(
     conn: psycopg.Connection,
     query_embedding: np.ndarray,
     top_k: int = TOP_K,
+    document_name: str = PDF_PATH.name,
 ) -> list[dict]:
-    """metadata 범위 안에서 cosine distance가 작은 Chunk를 검색한다."""
+    """지정 문서의 metadata 범위에서 cosine distance가 작은 Chunk를 검색한다."""
     if top_k <= 0:
         raise ValueError("top_k는 1 이상이어야 합니다.")
     if query_embedding.shape != (EMBEDDING_DIMENSION,):
@@ -118,7 +119,7 @@ def search_pgvector(
             """,
             (
                 query_embedding,
-                PDF_PATH.name,
+                document_name,
                 MODEL_NAME,
                 CHUNK_SIZE,
                 CHUNK_OVERLAP,

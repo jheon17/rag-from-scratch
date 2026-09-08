@@ -18,7 +18,6 @@ from rag_basic.pgvector_ingest import (
     ingest_document,
 )
 from rag_basic.pgvector_retrieval import (
-    count_baseline_rows,
     create_query_embedding,
     get_database_config,
     search_pgvector,
@@ -31,8 +30,9 @@ PDF_CONTENT_TYPES = {"application/pdf", "application/x-pdf"}
 
 
 class QueryRequest(BaseModel):
-    """Retrieval API가 받을 질문과 검색 결과 개수를 정의한다."""
+    """Retrieval API가 받을 문서명, 질문과 검색 결과 개수를 정의한다."""
 
+    document_name: str = Field(min_length=1, max_length=255)
     query: str = Field(min_length=1, max_length=1000)
     top_k: int = Field(default=5, ge=1, le=20)
 
@@ -49,8 +49,9 @@ class RetrievalResult(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """질문, 검색 결과와 조합된 Context의 응답 구조다."""
+    """검색 문서, 질문, 검색 결과와 조합된 Context의 응답 구조다."""
 
+    document_name: str
     query: str
     top_k: int
     results: list[RetrievalResult]
@@ -86,9 +87,25 @@ def get_embedding_model() -> SentenceTransformer:
     return SentenceTransformer(MODEL_NAME)
 
 
+def validate_document_name(document_name: str) -> str:
+    """경로가 없는 PDF 파일명인지 확인한다."""
+    if (
+        Path(document_name).name != document_name
+        or "\\" in document_name
+        or Path(document_name).suffix.lower() != ".pdf"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="document_name은 경로가 없는 PDF 파일명이어야 합니다.",
+        )
+    return document_name
+
+
 @app.post("/query", response_model=QueryResponse)
 def query_retrieval(request: QueryRequest) -> QueryResponse:
     """질문을 Embedding하고 pgvector Top-K 검색 결과를 반환한다."""
+    document_name = validate_document_name(request.document_name)
+
     try:
         model = get_embedding_model()
         query_embedding = create_query_embedding(model, request.query)
@@ -96,19 +113,27 @@ def query_retrieval(request: QueryRequest) -> QueryResponse:
 
         with psycopg.connect(**database_config) as conn:
             register_vector(conn)
-            count_baseline_rows(conn)
+            if count_document_rows(conn, document_name) == 0:
+                raise HTTPException(
+                    status_code=404,
+                    detail="요청한 문서를 찾을 수 없습니다.",
+                )
             results = search_pgvector(
                 conn,
                 query_embedding,
                 top_k=request.top_k,
+                document_name=document_name,
             )
 
         return QueryResponse(
+            document_name=document_name,
             query=request.query,
             top_k=request.top_k,
             results=results,
             context=build_context(results),
         )
+    except HTTPException:
+        raise
     except (OSError, ValueError, RuntimeError, psycopg.Error):
         raise HTTPException(
             status_code=503,

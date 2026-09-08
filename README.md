@@ -2739,6 +2739,398 @@ Answer + Source
 현재 `/query`는 Retrieval 결과와 Context를 반환하는 API이며 최종 자연어 Answer
 API는 아닙니다.
 
+### POST /ingest PDF Upload API
+
+기존에는 서버 컴퓨터에 있는 특정 PDF를 Python CLI로 적재했습니다. 이번 단계에서는
+사용자가 자신의 PDF를 HTTP `multipart/form-data`로 FastAPI에 업로드하고,
+PostgreSQL + pgvector에 적재할 수 있도록 확장했습니다.
+
+```text
+User PDF
+↓
+multipart/form-data
+↓
+POST /ingest
+↓
+Temporary PDF
+↓
+PDF Text Extraction
+↓
+Chunking
+↓
+Embedding
+↓
+PostgreSQL + pgvector
+```
+
+PDF 같은 파일은 JSON 문자열 안에 넣지 않고 `multipart/form-data`로 전송합니다.
+다음 명령의 `-F` 옵션은 사용자의 로컬 PDF를 FastAPI에 전달합니다.
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/ingest \
+  -F 'file=@sample.pdf;type=application/pdf'
+```
+
+업로드된 원본 PDF는 임시 파일에서 처리하며 서버에 영구 보관하지 않습니다.
+
+#### Upload 기본 검증
+
+- filename 필수
+- `.pdf` 확장자 확인
+- PDF content type 확인
+- 최대 크기 20 MiB
+- 경로를 제외한 basename만 `document_name`으로 사용
+- 임시 파일에서 PDF 처리
+- 처리 완료 후 임시 파일 삭제
+
+20 MiB는 현재 학습용 API에서 정한 제한이며 일반적인 production 표준을 의미하지
+않습니다.
+
+#### Ingest Response
+
+`POST /ingest` 응답에는 다음 정보가 포함됩니다.
+
+```text
+document_name
+chunk_count
+embedding_dimension
+embedding_model
+chunk_size
+chunk_overlap
+```
+
+응답 크기와 정보 노출 범위를 줄이기 위해 Embedding Vector 전체와 PDF 전체 내용은
+반환하지 않습니다.
+
+#### 기존 ingestion 코드 재사용
+
+API를 위해 Chunking, Embedding, DB INSERT 로직을 복사하지 않았습니다. 기존
+`pgvector_ingest.py`를 특정 `PDF_PATH`뿐 아니라 임의의 `document_name`도 처리할
+수 있도록 최소한으로 일반화하고, CLI와 FastAPI가 다음 pipeline을 함께
+재사용하도록 구성했습니다.
+
+```text
+load_pages()
+↓
+create_chunks()
+↓
+embed_texts(..., "passage")
+↓
+validate_embeddings()
+↓
+ingest_rows()
+↓
+validate_stored_data()
+```
+
+#### Duplicate 정책
+
+다음 metadata 조합이 이미 DB에 있으면 `HTTP 409 Conflict`를 반환합니다.
+
+```text
+document_name
+embedding_model
+chunk_size
+chunk_overlap
+```
+
+이는 기존 데이터를 의도치 않게 섞거나 남기는 일을 피하기 위한 단순한 초기
+정책입니다. overwrite, replace 및 delete 기능은 아직 구현하지 않았습니다.
+
+#### 실제 /ingest 검증
+
+baseline PDF의 bytes를 사용하되 multipart filename을
+`upload_test_ai_ethics.pdf`로 바꾸어 실제 업로드를 검증했습니다.
+
+```text
+HTTP success
+chunk_count: 162
+embedding_dimension: 384
+```
+
+DB에서도 row count, NULL 존재 여부, Embedding 차원과 Chunk ID 범위를 확인했습니다.
+같은 파일명으로 다시 업로드했을 때는 HTTP 409가 반환되고 row 수가 증가하지
+않았습니다. 검증 후 테스트 row만 삭제하고 baseline 문서는 유지했습니다.
+
+### Document-aware POST /query
+
+`POST /ingest`로 새 PDF를 DB에 넣을 수 있게 된 뒤에도 기존 `/query`는 baseline
+PDF만 검색하도록 고정되어 있었습니다. 따라서 업로드한 문서를 선택해서 검색할 수
+없었습니다. 이를 해결하기 위해 Query Request에 필수 `document_name`을
+추가했습니다.
+
+#### Query Request
+
+```json
+{
+  "document_name": "report.pdf",
+  "query": "질문",
+  "top_k": 5
+}
+```
+
+- `document_name`: 검색할 PDF
+- `query`: 검색 질문
+- `top_k`: 반환할 Chunk 수
+
+#### Metadata Filtering
+
+Vector Search가 질문과 의미적으로 가까운 Chunk를 찾는다면, `document_name`
+filter는 어느 PDF 안에서 검색할지 선택합니다.
+
+```text
+document_name으로 문서 범위 제한
+              +
+cosine Vector Search
+              ↓
+선택한 PDF 안에서 의미적으로 가까운 Chunk
+```
+
+SQL에는 문자열을 직접 조합하지 않고 parameter binding을 사용합니다.
+
+```text
+WHERE rag_chunks.document_name = %s
+```
+
+기존 `search_pgvector()`는 `PDF_PATH.name`을 고정해서 사용했지만, 이제
+`document_name`을 인자로 받을 수 있습니다.
+
+```python
+search_pgvector(
+    ...,
+    document_name=document_name,
+)
+```
+
+기본값은 기존 `PDF_PATH.name`을 유지합니다. 따라서 기존 CLI와 평가 코드가
+인자를 추가하지 않아도 baseline 문서를 검색하는 동작은 유지됩니다.
+
+#### Query Response
+
+응답에도 `document_name`을 포함하여 어느 PDF를 검색했는지 확인할 수 있습니다.
+
+```text
+document_name
+query
+top_k
+results
+context
+```
+
+#### Baseline 회귀 검증
+
+기존 `ai_ethics_guide.pdf`를 지정해 `/query`를 호출한 실제 결과입니다.
+
+```text
+HTTP 200
+Top-5 chunk_id: [28, 39, 3, 93, 35]
+context length: 2305
+```
+
+기존 pgvector CLI도 다시 실행해 다음 baseline 결과가 유지되는 것을 확인했습니다.
+
+```text
+copyright: [28, 39, 3, 93, 35]
+creative contribution: [28, 39, 30, 33, 31]
+France OOD: [136, 102, 65, 108, 96]
+```
+
+FAISS와 pgvector 비교 실험의 회귀 결과도 유지됐습니다.
+
+```text
+Exact Top-5 order match: 6/6
+
+FAISS
+Hit@5: 6/6
+MRR: 0.8750
+
+pgvector
+Hit@5: 6/6
+MRR: 0.8750
+```
+
+이는 현재 baseline 조건에서 함수 일반화로 인한 기존 검색 동작의 회귀가 없음을
+확인한 결과입니다.
+
+#### Upload → Query 연결 검증
+
+`upload_query_test_ai_ethics.pdf`를 `/ingest`로 적재한 뒤 해당
+`document_name`을 명시해 `/query`를 호출했습니다.
+
+```text
+HTTP 200
+document_name: upload_query_test_ai_ethics.pdf
+result count: 5
+Top-5 chunk_id: [28, 39, 3, 93, 35]
+context length: 2305
+```
+
+baseline과 같은 PDF bytes를 사용했기 때문에 실제 Top-5 결과도 같았습니다. 검증이
+끝난 뒤 업로드 테스트 row만 삭제했으며 baseline 162개 row는 유지했습니다.
+
+#### API 오류 검증
+
+```text
+document_name 누락
+→ HTTP 422
+
+존재하지 않는 document_name
+→ HTTP 404
+
+../../report.pdf
+→ HTTP 400
+```
+
+존재하지 않는 문서의 404가 내부 서비스 오류인 503으로 바뀌지 않고 의도한 HTTP
+의미를 유지하는 것도 확인했습니다.
+
+#### OpenAPI와 Swagger UI
+
+현재 OpenAPI에는 다음 Endpoint가 포함됩니다.
+
+```text
+GET  /health
+POST /query
+POST /ingest
+```
+
+`QueryRequest`와 `QueryResponse` 구조는 다음과 같습니다.
+
+```text
+QueryRequest
+- document_name (required)
+- query (required)
+- top_k
+
+QueryResponse
+- document_name
+- query
+- top_k
+- results
+- context
+```
+
+Swagger UI에서도 같은 구조를 확인할 수 있습니다.
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+#### 서비스화 최종 구조
+
+```text
+                ┌─────────────┐
+User PDF ──────→│ POST /ingest│
+                └──────┬──────┘
+                       ↓
+                 PDF Processing
+                       ↓
+                    Chunk
+                       ↓
+                   Embedding
+                       ↓
+             PostgreSQL + pgvector
+                       ↑
+                       │
+                 document_name
+                       │
+                ┌──────┴──────┐
+User Query ────→│ POST /query │
+                └──────┬──────┘
+                       ↓
+                Query Embedding
+                       ↓
+                Metadata Filter
+                       ↓
+                 Vector Search
+                       ↓
+               Top-K + Context
+```
+
+현재 API에는 자연어 Answer Generation이 포함되지 않았습니다.
+
+#### 실행 예시
+
+FastAPI 실행:
+
+```bash
+set -a
+source .env
+set +a
+
+HF_HUB_OFFLINE=1 \
+uv run uvicorn rag_basic.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+PDF Upload:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/ingest \
+  -F 'file=@sample.pdf;type=application/pdf'
+```
+
+문서별 Query:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document_name": "sample.pdf",
+    "query": "질문",
+    "top_k": 5
+  }'
+```
+
+#### 현재 제한
+
+- LLM Answer Generation
+- OpenAI 및 Ollama API 연결
+- Answer + Source API
+- 여러 문서 동시 검색
+- `document_id` 또는 UUID
+- 문서 목록 및 삭제 API
+- overwrite 및 replace
+- Similarity Threshold API 적용
+- Reranking API 적용
+- HNSW 및 IVFFlat
+- Connection Pool
+- 인증
+- CORS
+- FastAPI Docker화
+- 외부 인터넷 배포
+- LangChain
+
+현재 학습용 구현에서는 `document_name`을 문서 식별자로 사용합니다. 같은 파일명
+관리나 문서 rename이 필요한 서비스에서는 별도 `document_id` 사용을 고려할 수
+있지만 이번 단계에서는 구현하지 않았습니다.
+
+#### 다음 단계: pgvector Retrieval + LLM Generation
+
+다음 12단계에서는 다음 구조로 확장할 예정입니다.
+
+```text
+POST /query
+↓
+document_name
+↓
+Query Embedding
+↓
+pgvector Retrieval
+↓
+Context
+↓
+OpenAI / qwen3:8b
+↓
+Answer + Source
+```
+
+이는 다음 단계의 예정 구조이며 아직 구현된 기능은 아닙니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -2763,7 +3155,9 @@ API는 아닙니다.
 - [x] FAISS vs pgvector 비교
 - [x] FastAPI 기본 서버
 - [x] POST `/query` Retrieval API
-- [ ] POST `/ingest`
+- [x] POST `/ingest` PDF Upload API
+- [x] Document-aware `/query`
+- [ ] pgvector Retrieval + LLM Generation
 
 ## AI 도구 활용
 
