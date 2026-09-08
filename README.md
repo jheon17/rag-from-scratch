@@ -3927,18 +3927,113 @@ Generation 품질
 `temperature=0`과 `seed=42`가 모든 환경에서 완전한 determinism을 보장한다고
 일반화할 수 없습니다.
 
-### 다음 단계: Generation 실패 원인 분석
+### Generation 실패 원인 진단
 
-다음 12-2C 단계에서는 우선 `ai_assignment_submission` Case의 다음 내용을
-확인할 예정입니다.
+12-2C-1에서는 `ai_assignment_submission` Case 하나만 대상으로 실제 `/query`
+응답에 포함된 Retrieval 결과, Context, 최종 Prompt와 Generation 답변을
+확인했습니다.
 
-- 실제 Top-5 Context 전체
-- gold Chunk 내용
-- 실제 `build_local_rag_prompt()` 결과
-- 질문, Context 및 Grounding rule 사이의 충돌 여부
+질문은 다음과 같습니다.
 
-아직 Prompt는 수정하지 않습니다. 원인을 먼저 확인한 뒤 최소 Prompt 변경이
-필요한지 결정할 예정입니다.
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+```
+
+실제 기본 결과는 다음과 같습니다.
+
+```text
+HTTP status: 200
+Top-5 chunk_id: [69, 68, 76, 70, 75]
+context length: 2197
+prompt length: 2467
+expected_chunk_ids: [68, 69, 70]
+```
+
+구조 진단 결과는 다음과 같습니다.
+
+```text
+gold chunk가 Top-5에 존재: True
+first gold rank: 1
+Source 1 gold: True
+Source 1 citation 존재: True
+NO_ANSWER 문구 포함: True
+exact NO_ANSWER: False
+```
+
+Source 1인 `chunk_id=69`에는 다음과 같은 직접적인 근거가 있었습니다.
+
+```text
+따라서 생성형 AI를 이용한 결과물을 그대로 과제로 제출해서는 안 됩니다.
+```
+
+Source 1의 text를 단순 문자열 기준으로 확인한 결과도 다음과 같습니다.
+
+```text
+과제: True
+제출: True
+그대로: True
+생성형 AI: True
+```
+
+이 확인은 문장의 의미를 평가한 semantic 판단이 아니라, 해당 문자열이 실제
+text에 포함되는지만 검사한 literal string 확인입니다.
+
+실제 Generation 답변은 다음과 같았습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+제공된 문서에서 확인할 수 없습니다.
+
+[Source 1]
+[Source 2]
+[Source 3]
+[Source 4]
+[Source 5]
+```
+
+gold evidence가 Retrieval rank 1에 존재했지만 모델은 이를 직접적인 답변으로
+활용하지 못했습니다. 따라서 현재 결과는 다음과 같은 단순 원인만으로 설명하기
+어렵습니다.
+
+```text
+gold evidence가 검색되지 않음
+질문 관련 표현이 Context에 없음
+답변 근거가 Context에 없음
+```
+
+다만 이 진단만으로 Prompt, `qwen3:8b` 또는 여러 Context가 원인이라고 확정하지
+않습니다.
+
+현재까지 확인된 문제의 흐름은 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Generation 재현성
+→ temperature=0, seed=42 이후 반복 출력 고정
+
+Generation 품질
+→ 부적절한 refusal 유지
+```
+
+즉 Retrieval과 Generation randomness를 분리한 뒤에도 Generation 품질 문제가
+남아 있음을 확인했습니다.
+
+### 다음 단계: Context Ablation
+
+12-2C-2에서는 동일한 질문에 전달하는 Context만 다음과 같이 바꿔 비교할
+예정입니다.
+
+```text
+A. Source 1만 사용
+B. gold Source들만 사용
+C. 기존 Top-5 전체 사용
+```
+
+이 비교의 목적은 정답 Source 하나만 있어도 refusal하는지, 여러 Source가 함께
+있을 때 refusal하는지를 구분하는 것입니다. Context Ablation은 아직 수행하지
+않았습니다.
 
 ## 진행 상황
 
@@ -3970,7 +4065,8 @@ Generation 품질
 - [x] 최종 RAG API Evaluation Baseline
 - [x] Local LLM Generation 변동성 Baseline
 - [x] Generation 재현성 설정 비교
-- [ ] Generation 실패 원인 분석
+- [x] Generation 실패 원인 진단
+- [ ] Context Ablation
 
 ## AI 도구 활용
 
