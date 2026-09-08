@@ -4594,25 +4594,240 @@ New-only "요!" 2자
 따라서 다음에는 near-duplicate 여부와 추가 text 길이를 분리하는 length-matched
 control이 필요합니다.
 
-### 다음 단계: Length-Matched Duplicate Control Ablation
+### Length-Matched Duplicate Control Ablation
 
-12-2C-6에서는 동일한 약 100자의 추가 Context에서 중복 text와 non-duplicate
-text의 behavior를 비교할 예정입니다.
+이전 Duplicate Context Ablation에서는 다음 결과가 관찰됐습니다.
 
 ```text
-A. Source 1 only
+Source 1 only
+→ refusal 0/3
 
-B. Source 1 + duplicate 100자
-   - 기존 overlap-only
+Source 1 + overlap-only 100자
+→ refusal 3/3
 
-C. Source 1 + non-duplicate 100자
-   - 실제 Retrieval Source에서 가져온 Source 1과 exact overlap이 없는 control text
-   - duplicate 조건과 길이를 동일하게 맞춤
+Source 1 + new-only "요!" 2자
+→ refusal 0/3
 ```
 
-가능하면 control text는 기존 Retrieval 결과 안에서 가져와 새로운 외부 지식을
-만들지 않습니다. 추가 text 길이는 동일하게 유지하면서 near-duplicate 여부만
-다르게 비교하는 것이 목적이며, 이 실험은 아직 수행하지 않았습니다.
+하지만 duplicate 조건과 new-only 조건은 추가 text 길이가 각각 100자와 2자로
+달랐습니다. 이 길이 차이라는 confound를 줄이기 위해 12-2C-6에서는 duplicate
+100자와 non-duplicate control 100자를 비교했습니다. 두 synthetic Source에는
+동일한 Source 4 metadata를 사용했습니다.
+
+Generation 설정은 다음과 같이 유지했습니다.
+
+```text
+model = qwen3:8b
+temperature = 0
+seed = 42
+REPEAT_COUNT = 5
+```
+
+#### 실제 Retrieval과 Source
+
+```text
+rank=1, chunk_id=69, page_number=33, gold=True
+rank=2, chunk_id=68, page_number=33, gold=True
+rank=3, chunk_id=76, page_number=35, gold=False
+rank=4, chunk_id=70, page_number=33, gold=True
+rank=5, chunk_id=75, page_number=35, gold=False
+```
+
+비교에 사용한 Source는 다음과 같습니다.
+
+```text
+Source 1: rank=1, chunk_id=69, page=33, length=500
+Source 2: rank=2, chunk_id=68, page=33, length=500
+Source 4: rank=4, chunk_id=70, page=33, length=102
+```
+
+#### Duplicate 계산
+
+Source 1의 suffix와 Source 4의 prefix 사이에서 가장 긴 exact overlap을 계산한
+결과는 다음과 같습니다.
+
+```text
+Source 1 ↔ Source 4 duplicate length: 100
+Source 1 suffix == duplicate text: True
+```
+
+Duplicate text 전체는 다음과 같습니다.
+
+```text
+ 뿐만 아니라, 기망으로 인한 교수자의 수업권 침해 우려도 있어요. 생성형 AI는 과제의 보조적인 도구로만 활용하고 최종적인 보고서의 완성은 학습자 본인이 직접 하는 것이 바람직해
+```
+
+#### Length-matched Control 생성
+
+외부 문장을 만들지 않고 실제 Source 2에서 control을 가져왔습니다. Source 2와
+Source 1 사이의 중복 suffix 100자를 제외한 뒤, 남은 non-overlap 영역의 첫
+100자를 사용했습니다.
+
+```text
+Source 2 → Source 1 exact suffix-prefix overlap: 100
+Source 2 non-overlap length: 400
+```
+
+Control text 전체는 다음과 같습니다.
+
+```text
+31 1 과제로 보고서를 쓰는데 시간도 절약되고 쉬울 것 같아서 생성형 AI를 통해 작성하려고요. 요즘 많이들 그렇게 하던데 그대로 제출해도 문제가 없겠죠? 생성형 AI를 과제나
+```
+
+길이와 중복 여부 검증 결과는 다음과 같습니다.
+
+```text
+duplicate length: 100
+control length: 100
+length matched: True
+control text is exact substring of Source 1: False
+```
+
+두 text의 실제 내용 차이를 투명하게 확인하기 위해 질문 관련 문자열의 위치도
+기록했습니다.
+
+```text
+duplicate:
+과제: [46]
+제출: []
+그대로: []
+생성형 AI: [38]
+
+control:
+과제: [5, 96]
+제출: [74]
+그대로: [70]
+생성형 AI: [36, 88]
+```
+
+이는 semantic equality 평가가 아니라 단순 literal string 확인입니다. Control
+text에도 현재 질문과 직접 관련된 표현이 여러 개 포함돼 있습니다.
+
+#### 입력 통제
+
+```text
+B/C synthetic Source metadata 동일 여부: True
+
+duplicate context length: 672
+control context length: 672
+duplicate/control Context length 동일 여부: True
+
+duplicate prompt length: 942
+control prompt length: 942
+duplicate/control Prompt length 동일 여부: True
+```
+
+따라서 duplicate/control 조건은 Source metadata, Source number, 추가 text 길이,
+Context 길이, Prompt 길이가 같습니다. 두 조건에서 의도적으로 다른 것은 추가되는
+text 내용입니다.
+
+#### 비교 결과
+
+다음 세 조건을 각각 5회 실행했습니다.
+
+```text
+SOURCE_1_ONLY
+SOURCE_1_PLUS_DUPLICATE_100
+SOURCE_1_PLUS_CONTROL_100
+```
+
+| Condition | NO_ANSWER 포함 | Exact NO_ANSWER | Unique answers | Citation 유효 |
+| --- | ---: | ---: | ---: | ---: |
+| SOURCE_1_ONLY | 0/5 | 0/5 | 1 | 5/5 |
+| SOURCE_1_PLUS_DUPLICATE_100 | 4/5 | 0/5 | 2 | 5/5 |
+| SOURCE_1_PLUS_CONTROL_100 | 0/5 | 0/5 | 1 | 5/5 |
+
+`SOURCE_1_ONLY`에서는 5회 모두 다음과 같이 직접 답했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되지 않습니다. [Source 1]
+```
+
+Control 조건에서도 5회 모두 직접 답했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해서는 안 됩니다. [Source 1]
+```
+
+Duplicate 조건에서는 한 번 직접 답했으며, 나머지 네 번은 질문 문장과
+`제공된 문서에서 확인할 수 없습니다.`라는 문구 및 `[Source 1]`을 함께
+출력했습니다.
+
+핵심 비교 결과는 다음과 같습니다.
+
+```text
+duplicate refusal count: 4/5
+control refusal count: 0/5
+```
+
+동일 길이의 control과 비교했을 때 duplicate 조건에서 더 많은 refusal behavior가
+관찰됐습니다. 따라서 duplicate 조건이 단순히 100자 더 길기 때문에 refusal이
+발생했을 수 있다는 설명은 이번 실험으로 더 약해졌습니다.
+
+Control text에는 `과제`, `제출`, `그대로`, `생성형 AI`처럼 현재 질문과 직접
+관련된 literal 표현이 duplicate text보다 더 많이 포함됐지만 refusal은 0/5였습니다.
+따라서 질문 관련 keyword가 많이 포함돼 refusal이 발생한다는 설명도 이번 결과에는
+잘 맞지 않습니다. 다만 semantic content를 완전히 통제한 실험은 아니므로 확정적인
+반증으로 해석하지 않습니다.
+
+Duplicate 조건은 refusal 4/5, Unique answers 2였습니다. 따라서
+`temperature=0`, `seed=42`를 유지하더라도 완전한 Generation determinism이
+보장된다고 일반화하지 않습니다.
+
+이번 실험에서 강하게 관찰된 것은 동일 길이와 동일 Source metadata 조건에서
+near-duplicate text가 추가된 조건이 non-duplicate control보다 더 많은 refusal
+behavior를 보였다는 점입니다. 그러나 이를 near-duplicate가 refusal의 원인이라고
+확정하거나 Chunk overlap, Prompt 또는 qwen3:8b 자체의 문제라고 단정하지 않습니다.
+Duplicate와 control은 길이와 Source metadata는 동일하지만 semantic content까지
+동일하게 통제된 것은 아니기 때문입니다.
+
+현재까지의 진단 흐름은 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Source 1 only
+→ 직접 답변
+
+Source 4 포함
+→ refusal behavior 증가
+
+Source 4
+→ 102자 중 100자가 Source 1과 near-duplicate
+
+Duplicate-only 100자
+→ refusal 증가
+
+New-only "요!" 2자
+→ refusal 없음
+
+Length-matched non-duplicate 100자
+→ refusal 없음
+
+Length-matched duplicate 100자
+→ refusal 4/5
+```
+
+#### 다음 단계: Near-Duplicate Context Filtering Experiment
+
+12-2C-7에서는 synthetic Context 조작을 넘어, 실제 Top-5 Retrieval 결과에서
+이미 선택된 Source와 높은 text overlap을 가지는 후순위 Source를 Context 구성
+단계에서 제외했을 때 Generation behavior가 개선되는지 확인할 예정입니다.
+
+```text
+Actual Top-5 Retrieval
+→ 원본 Context 생성
+
+Actual Top-5 Retrieval
+→ 이미 선택된 Source와 높은 text overlap을 가지는 후순위 Source를
+  diagnostic 단계에서 제외
+→ filtered Context 생성
+```
+
+이는 Retrieval 결과 자체를 바꾸는 실험이 아닙니다. 두 Context에 동일한 Query,
+Prompt, model 설정을 사용해 Generation을 비교할 예정이며, 아직 Production 코드를
+변경하거나 필터를 최종 기능으로 채택한 것은 아닙니다.
 
 ## 진행 상황
 
@@ -4649,7 +4864,8 @@ C. Source 1 + non-duplicate 100자
 - [x] Gold Source Interaction Ablation
 - [x] Source 4 Content Diagnosis
 - [x] Duplicate Context Ablation
-- [ ] Length-Matched Duplicate Control Ablation
+- [x] Length-Matched Duplicate Control Ablation
+- [ ] Near-Duplicate Context Filtering Experiment
 
 ## AI 도구 활용
 
