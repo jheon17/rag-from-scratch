@@ -3131,6 +3131,364 @@ Answer + Source
 
 이는 다음 단계의 예정 구조이며 아직 구현된 기능은 아닙니다.
 
+## 12. pgvector Retrieval + Local LLM Generation
+
+기존 `/query`는 pgvector에서 관련 Chunk를 검색하고 Context를 JSON으로 반환하는
+단계까지 수행했습니다. 이번 단계에서는 기존 Local LLM 코드를 재사용하여 다음
+흐름을 실제 FastAPI HTTP 경로로 연결했습니다.
+
+```text
+POST /query
+↓
+document_name
+↓
+Query Embedding
+↓
+PostgreSQL + pgvector
+↓
+Top-K Retrieval
+↓
+Context
+↓
+Grounding Prompt
+↓
+Ollama
+↓
+qwen3:8b
+↓
+Answer + Source
+```
+
+### 최종 Generation 모델 선택
+
+프로젝트 과정에서 `src/rag_basic/llm.py`를 통해 OpenAI 기반 RAG를 구현했고,
+`local_llm.py`와 `local_rag.py`를 통해 `qwen3:8b` 기반 Local RAG도 구현했습니다.
+두 Generation 방식을 기존 소규모 평가셋에서 비교해 본 뒤, 최종 FastAPI 서비스
+경로에는 외부 API Key 없이 로컬에서 재현할 수 있는 `Ollama + qwen3:8b`를
+선택했습니다.
+
+이는 현재 소규모 평가와 개발 환경을 기준으로 선택한 구조입니다. `qwen3:8b`가
+OpenAI와 일반적으로 동일하거나 더 우수한 성능을 갖는다는 의미는 아닙니다. 기존
+OpenAI 실험 코드는 비교와 학습 기록으로 계속 유지합니다.
+
+### 기존 Local RAG 코드 재사용
+
+FastAPI 안에 Ollama HTTP 호출이나 Grounding Prompt를 복사하지 않았습니다.
+`local_llm.py`의 다음 요소를 재사용합니다.
+
+- `generate_local_answer()`
+- `LOCAL_MODEL_NAME`
+- `LocalLLMError`
+
+Prompt는 `local_rag.py`의 `build_local_rag_prompt()`를 재사용합니다.
+
+```text
+pgvector results
+↓
+build_context()
+↓
+build_local_rag_prompt()
+↓
+generate_local_answer()
+```
+
+### Retrieval과 Generation의 역할
+
+Retrieval은 질문에 답하는 데 사용할 근거 Chunk를 찾는 단계이고, Generation은
+검색된 Context를 바탕으로 자연어 답변을 만드는 단계입니다. 현재 API에서도 두
+역할을 분리했습니다.
+
+동일한 `/query` 요청 안에서 Retrieval은 한 번만 수행합니다. 검색 결과로 Context를
+한 번 생성하고, 그 문자열을 응답과 `qwen3:8b` Generation에서 함께 사용합니다.
+
+### Grounding 규칙
+
+기존 Local RAG Prompt의 다음 규칙을 그대로 사용했습니다.
+
+- 제공된 Context만 근거로 답변
+- 일반 지식으로 내용을 보충하지 않음
+- 근거가 부족하면 정확히 `제공된 문서에서 확인할 수 없습니다.`라고 답변
+- `[Source N]` 형태로 근거 표시
+- 간결한 한국어로 답변
+
+이번 연결 단계에서는 Prompt 자체를 새로 튜닝하지 않았습니다.
+
+### Query Response
+
+현재 `/query` 응답은 다음 정보를 포함합니다.
+
+```text
+document_name
+query
+top_k
+results
+context
+answer
+llm_model
+```
+
+`answer`는 `qwen3:8b`가 생성한 최종 자연어 답변이며, `llm_model`은 실제 사용한
+모델인 `qwen3:8b`를 나타냅니다.
+
+### Source 연결
+
+검색 결과와 Source 번호는 다음처럼 연결됩니다.
+
+```text
+results[0] → Source 1
+results[1] → Source 2
+...
+```
+
+`build_context()`는 각 검색 결과를 다음 header와 함께 Context에 넣습니다.
+
+```text
+[Source 1 | page=... | chunk_id=...]
+```
+
+LLM 답변의 `[Source 1]`은 이에 대응하는 첫 번째 Retrieval result를 가리킵니다.
+이번 단계에서는 별도 Citation parser나 Source 객체를 API 응답에 추가하지
+않았습니다.
+
+### Ollama 환경
+
+실제 검증 환경은 다음과 같습니다.
+
+```text
+Ollama: 0.33.3
+Model: qwen3:8b
+Model size: 약 5.2 GB
+Ollama API: http://127.0.0.1:11434
+```
+
+Ollama API에 실제 연결되고 모델 목록에 `qwen3:8b`가 존재하는 것을 확인했습니다.
+현재 최종 FastAPI API에는 OpenAI API Key가 필요하지 않습니다.
+
+### 기존 Local LLM 회귀 검증
+
+다음 명령을 다시 실행하여 Retrieval이 없는 `qwen3:8b` 단독 호출이 정상
+동작하는지 확인했습니다.
+
+```bash
+uv run python -m rag_basic.local_llm
+```
+
+`RAG에서 Retrieval이 필요한 이유`를 묻는 테스트에서 비어 있지 않은 한국어
+답변이 생성됐습니다.
+
+기존 FAISS 기반 Local RAG도 다시 검증했습니다.
+
+```bash
+HF_HUB_OFFLINE=1 \
+uv run python -m rag_basic.local_rag
+```
+
+검증 결과:
+
+```text
+정상 질문 chunk_id: [28, 39, 3, 93, 35]
+Context length: 2305
+[Source] Citation 존재: True
+
+France OOD 답변:
+제공된 문서에서 확인할 수 없습니다.
+정확한 refusal 문장 일치: True
+```
+
+이는 기존 FAISS 기반 Local RAG의 회귀 검증입니다. 최종 FastAPI 경로는 FAISS가
+아닌 PostgreSQL + pgvector Retrieval을 사용합니다.
+
+### FastAPI 정상 질문 검증
+
+baseline 문서 `ai_ethics_guide.pdf`와 기존 저작권 평가 질문으로 실제 HTTP
+`POST /query`를 호출했습니다.
+
+```text
+HTTP status: 200
+document_name: ai_ethics_guide.pdf
+top_k: 5
+result count: 5
+Top-5 chunk_id: [28, 39, 3, 93, 35]
+context length: 2305
+llm_model: qwen3:8b
+answer non-empty: True
+```
+
+실제 생성된 답변은 다음과 같습니다.
+
+```text
+생성형 AI가 만든 이미지의 저작권은 일반적으로 인간의 창작물로 인정되지 않기 때문에 특정한 개인이나 기관에 소유권이 귀속되지 않습니다. [Source 1]
+```
+
+이는 현재 검색 문서와 Prompt를 기반으로 `qwen3:8b`가 생성한 검증 결과이며,
+README에서 별도의 법률적 일반 사실로 해석하지 않습니다.
+
+답변의 Citation도 다음과 같이 확인했습니다.
+
+```text
+Citation Source 번호: [1]
+Source 번호 범위 유효: True
+```
+
+이 검증은 Citation 형식이 맞는지와 Source 번호가 현재 Retrieval result 범위 안에
+있는지만 확인합니다. 자동 faithfulness 또는 답변 정확성 평가가 아닙니다. Source
+내용이 답변을 충분히 뒷받침하는지는 후속 최종 평가에서 별도로 확인할 예정입니다.
+
+### FastAPI OOD 검증
+
+France OOD 질문도 같은 API 경로로 확인했습니다.
+
+```text
+HTTP status: 200
+Top-5 chunk_id: [136, 102, 65, 108, 96]
+context length: 2501
+llm_model: qwen3:8b
+answer: 제공된 문서에서 확인할 수 없습니다.
+exact refusal: True
+```
+
+```text
+Retrieval
+→ OOD 질문에도 가장 가까운 Top-5 반환
+
+Generation
+→ Context에 답이 없으므로 refusal
+```
+
+Retrieval 결과가 존재한다는 사실만으로 그 Chunk가 질문에 대한 실제 근거라는 뜻은
+아닙니다.
+
+### HTTP 오류 회귀
+
+Generation 연결 후에도 기존 오류 의미가 유지됐습니다.
+
+```text
+document_name 누락
+→ HTTP 422
+
+존재하지 않는 document
+→ HTTP 404
+
+../../report.pdf
+→ HTTP 400
+```
+
+세 요청은 모두 Local LLM Generation 단계에 도달하기 전에 종료됩니다.
+
+Ollama 호출 실패는 기존 `LocalLLMError`를 받아 HTTP 503의 일반적인 서비스 오류로
+변환하도록 구성했습니다. 내부 오류 상세와 stack trace는 HTTP 응답에 직접
+전달하지 않습니다. 이번 작업에서는 실제 Ollama 장애 상황의 HTTP 503을 별도로
+검증하지 않았습니다.
+
+### OpenAPI
+
+현재 Endpoint는 다음과 같습니다.
+
+```text
+GET  /health
+POST /ingest
+POST /query
+```
+
+OpenAPI에서도 다음 `QueryResponse` 구조를 확인했습니다.
+
+```text
+document_name
+query
+top_k
+results
+context
+answer
+llm_model
+```
+
+### 현재 Architecture
+
+```text
+User
+ │
+ │ PDF
+ ▼
+POST /ingest
+ │
+ ▼
+PDF Parsing
+ │
+ ▼
+Chunking
+ │
+ ▼
+Embedding
+ │
+ ▼
+PostgreSQL + pgvector
+ ▲
+ │
+ │ document_name
+ │
+POST /query
+ │
+ ▼
+Query Embedding
+ │
+ ▼
+Metadata Filtering
+ │
+ ▼
+Vector Search
+ │
+ ▼
+Top-K Retrieval
+ │
+ ▼
+Context
+ │
+ ▼
+Grounding Prompt
+ │
+ ▼
+Ollama
+ │
+ ▼
+qwen3:8b
+ │
+ ▼
+Answer + [Source N]
+```
+
+현재 검증 범위에서는 PDF Upload부터 Chunking, Embedding, PostgreSQL/pgvector
+Retrieval, Context, Local LLM Generation과 Source가 포함된 답변까지 실제 FastAPI
+HTTP 경로로 연결했습니다. 이는 production-ready, 대규모 트래픽 지원, 완전한
+보안 또는 RAG 답변 품질 보장을 의미하지 않습니다.
+
+### 실행 조건과 방법
+
+FastAPI를 실행하기 전에 Ollama 서비스와 `qwen3:8b`가 준비되어 있어야 합니다.
+
+```bash
+ollama list
+```
+
+DB 환경변수를 불러온 뒤 FastAPI를 실행합니다. 실제 password는 README에 기록하지
+않습니다.
+
+```bash
+set -a
+source .env
+set +a
+
+HF_HUB_OFFLINE=1 \
+uv run uvicorn rag_basic.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+### 다음 단계: 최종 RAG API Evaluation
+
+다음 12-2 단계에서는 기존 9개 Evaluation Case의 Retrieval 지표와 Generation
+기본 검증, Citation 유효성, OOD refusal 및 서로 다른 실제 PDF의 document
+filtering을 최종 서비스 경로에서 검증할 예정입니다. 아직 완료된 단계는 아닙니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -3157,7 +3515,8 @@ Answer + Source
 - [x] POST `/query` Retrieval API
 - [x] POST `/ingest` PDF Upload API
 - [x] Document-aware `/query`
-- [ ] pgvector Retrieval + LLM Generation
+- [x] pgvector Retrieval + qwen3:8b Generation
+- [ ] 최종 RAG API Evaluation
 
 ## AI 도구 활용
 

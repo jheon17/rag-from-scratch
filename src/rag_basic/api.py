@@ -13,6 +13,12 @@ from sentence_transformers import SentenceTransformer
 
 from rag_basic.chunking import CHUNK_OVERLAP, CHUNK_SIZE
 from rag_basic.embedding import MODEL_NAME
+from rag_basic.local_llm import (
+    LOCAL_MODEL_NAME,
+    LocalLLMError,
+    generate_local_answer,
+)
+from rag_basic.local_rag import build_local_rag_prompt
 from rag_basic.pgvector_ingest import (
     count_document_rows,
     ingest_document,
@@ -49,13 +55,15 @@ class RetrievalResult(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """검색 문서, 질문, 검색 결과와 조합된 Context의 응답 구조다."""
+    """검색 결과와 Context, Local LLM 답변의 응답 구조다."""
 
     document_name: str
     query: str
     top_k: int
     results: list[RetrievalResult]
     context: str
+    answer: str
+    llm_model: str
 
 
 class IngestResponse(BaseModel):
@@ -103,7 +111,7 @@ def validate_document_name(document_name: str) -> str:
 
 @app.post("/query", response_model=QueryResponse)
 def query_retrieval(request: QueryRequest) -> QueryResponse:
-    """질문을 Embedding하고 pgvector Top-K 검색 결과를 반환한다."""
+    """pgvector 검색 Context를 근거로 Local LLM 답변을 생성한다."""
     document_name = validate_document_name(request.document_name)
 
     try:
@@ -125,13 +133,6 @@ def query_retrieval(request: QueryRequest) -> QueryResponse:
                 document_name=document_name,
             )
 
-        return QueryResponse(
-            document_name=document_name,
-            query=request.query,
-            top_k=request.top_k,
-            results=results,
-            context=build_context(results),
-        )
     except HTTPException:
         raise
     except (OSError, ValueError, RuntimeError, psycopg.Error):
@@ -139,6 +140,26 @@ def query_retrieval(request: QueryRequest) -> QueryResponse:
             status_code=503,
             detail="Retrieval 서비스를 사용할 수 없습니다.",
         ) from None
+
+    context = build_context(results)
+    prompt = build_local_rag_prompt(request.query, context)
+    try:
+        answer = generate_local_answer(prompt)
+    except LocalLLMError:
+        raise HTTPException(
+            status_code=503,
+            detail="Local LLM 서비스를 사용할 수 없습니다.",
+        ) from None
+
+    return QueryResponse(
+        document_name=document_name,
+        query=request.query,
+        top_k=request.top_k,
+        results=results,
+        context=context,
+        answer=answer,
+        llm_model=LOCAL_MODEL_NAME,
+    )
 
 
 @app.post("/ingest", response_model=IngestResponse)
