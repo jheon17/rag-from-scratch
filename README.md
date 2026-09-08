@@ -2390,6 +2390,355 @@ JSON Response
 이 단계에서도 LLM 답변 생성은 연결하지 않고 Retrieval 결과를 JSON으로 반환하는
 것까지만 구현할 예정입니다.
 
+### POST /query Retrieval API
+
+기존에는 pgvector Retrieval을 Python module에서 직접 실행해야 했습니다. 이번
+단계에서는 Embedding과 SQL 검색을 새로 구현하지 않고 기존 Retrieval 함수를
+FastAPI Endpoint 뒤에 연결했습니다.
+
+```text
+HTTP Request
+↓
+FastAPI
+↓
+기존 Retrieval 함수
+↓
+PostgreSQL + pgvector
+↓
+JSON Response
+```
+
+현재 `/query`는 검색 결과와 Context를 반환하는 Retrieval API입니다. OpenAI,
+Ollama 또는 자연어 Answer를 생성하는 LLM은 아직 연결하지 않았습니다.
+
+#### Endpoint와 Request Body
+
+새 Endpoint는 다음과 같습니다.
+
+```text
+POST /query
+```
+
+기본 Request Body 구조:
+
+```json
+{
+  "query": "질문",
+  "top_k": 5
+}
+```
+
+`query`는 검색할 질문 문자열이고, `top_k`는 반환할 검색 결과의 최대 개수입니다.
+
+#### Pydantic 입력 및 출력 검증
+
+Pydantic은 Request가 실제 Retrieval 로직에 들어가기 전에 입력 조건을 확인하고,
+응답 구조를 OpenAPI에 명확하게 표현합니다.
+
+`QueryRequest`의 조건:
+
+```text
+query
+- 최소 1자
+- 최대 1000자
+
+top_k
+- 기본값 5
+- 최소 1
+- 최대 20
+```
+
+`QueryResponse`는 다음 항목을 포함합니다.
+
+```text
+query
+top_k
+results
+context
+```
+
+각 Retrieval result에는 다음 metadata와 원문이 포함됩니다.
+
+```text
+rank
+score
+cosine_distance
+chunk_id
+page_number
+text
+```
+
+`api.py`에서 Pydantic을 직접 import하므로 FastAPI의 간접 dependency에만 의존하지
+않고 프로젝트의 direct dependency로 명시했습니다.
+
+```text
+pydantic>=2.13.5
+```
+
+#### 기존 Retrieval 코드 재사용
+
+API용 Embedding이나 SQL Vector Search를 다시 작성하지 않았습니다.
+`rag_basic.pgvector_retrieval`에서 다음 함수를 재사용했습니다.
+
+```text
+get_database_config()
+count_baseline_rows()
+create_query_embedding()
+search_pgvector()
+```
+
+검색 결과를 LLM에 전달할 수 있는 문자열로 합칠 때는 `rag_basic.retrieval`의
+`build_context()`를 그대로 사용했습니다.
+
+```text
+POST /query
+↓
+create_query_embedding()
+↓
+search_pgvector()
+↓
+build_context()
+↓
+JSON Response
+```
+
+#### Embedding Model 재사용
+
+Query Embedding에는 기존 `intfloat/multilingual-e5-small` 모델을 사용합니다.
+SentenceTransformer 모델을 요청마다 다시 로드하지 않도록
+`lru_cache(maxsize=1)`를 적용했습니다.
+
+```text
+FastAPI import
+→ Model 미로드
+
+첫 /query
+→ Model 로드
+
+이후 /query
+→ 같은 Process에서 Model 재사용
+```
+
+실제 import 검증에서도 다음 결과를 확인했습니다.
+
+```text
+모델 cache size: 0
+```
+
+따라서 module import만으로 모델을 즉시 로드하지 않고, 첫 `/query` 요청에서
+필요할 때 로드합니다.
+
+#### PostgreSQL Connection
+
+현재는 `/query` 요청마다 PostgreSQL Connection을 하나 열고 검색이 끝나면
+context manager를 통해 닫습니다.
+
+```text
+/query
+↓
+DB Connection 생성
+↓
+pgvector Search
+↓
+Connection 종료
+```
+
+현재 학습용 규모에서는 이해하기 쉬운 단순한 구조를 우선했으며 Connection Pool은
+아직 구현하지 않았습니다.
+
+#### 실제 HTTP 검증
+
+`/query`를 추가한 뒤 기존 Health Endpoint도 회귀 검증했습니다.
+
+```text
+GET /health
+
+HTTP 200
+{"status":"ok"}
+```
+
+기존 `copyright_in_domain` 질문을 실제 `POST /query` 요청으로 전달한 결과는 다음과
+같습니다.
+
+```text
+HTTP status: 200
+top_k: 5
+result 수: 5
+ranks: [1, 2, 3, 4, 5]
+Top-5 chunk_id: [28, 39, 3, 93, 35]
+context length: 2305
+```
+
+Top-5는 기존에 Python module로 직접 실행한 pgvector Retrieval 결과인
+`[28, 39, 3, 93, 35]`와 동일했습니다. 현재 조건에서는 HTTP API 계층을 추가한
+뒤에도 기존 Retrieval 결과가 유지되는 것을 확인했습니다.
+
+문서 밖 질문인 `france_out_of_domain`도 실제로 요청했습니다.
+
+```text
+HTTP status: 200
+result 수: 5
+Top-5 chunk_id: [136, 102, 65, 108, 96]
+context length: 2501
+```
+
+현재 API에는 Similarity Threshold, OOD Classifier 또는 LLM refusal이 없습니다.
+따라서 문서 밖 질문에도 pgvector가 저장된 Vector 중 가장 가까운 Top-5 Chunk를
+반환하는 것이 정상이며, 이 결과가 France 질문의 정답을 제공한다는 의미는
+아닙니다.
+
+#### Validation 검증
+
+잘못된 Request도 실제 HTTP 요청으로 확인했습니다.
+
+```text
+top_k=0
+→ HTTP 422
+
+query 누락
+→ HTTP 422
+```
+
+HTTP `422`는 Request 데이터가 `QueryRequest`의 조건을 만족하지 않아
+FastAPI/Pydantic 검증 단계에서 거절됐다는 의미입니다.
+
+#### 오류 처리
+
+DB 연결이나 Retrieval 의존성에 문제가 생기면 password와 Connection String 같은
+내부 정보를 HTTP Response에 직접 노출하지 않고 다음과 같은 일반적인 오류로
+처리합니다.
+
+```text
+HTTP 503
+Retrieval 서비스를 사용할 수 없습니다.
+```
+
+이번 단계에서는 복잡한 Exception hierarchy는 구현하지 않았습니다.
+
+#### OpenAPI와 Swagger UI
+
+실제 OpenAPI schema에서 다음 항목을 확인했습니다.
+
+```text
+/health GET: True
+/query POST: True
+QueryRequest schema: True
+QueryResponse schema: True
+```
+
+Swagger UI에서도 Request와 Response 구조를 확인할 수 있습니다.
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+#### 현재 API 구조
+
+```text
+Client
+↓
+HTTP POST /query
+↓
+Uvicorn
+↓
+FastAPI
+↓
+Pydantic Validation
+↓
+Query Embedding
+↓
+PostgreSQL + pgvector
+↓
+Top-K Chunk
+↓
+build_context()
+↓
+JSON Response
+```
+
+이 구조에는 아직 LLM Answer Generation이 포함되어 있지 않습니다.
+
+#### 실행 예시
+
+실제 password는 README에 기록하지 않고 Git에서 제외된 `.env`를 shell
+환경변수로 불러옵니다. 검증에서는 로컬에 캐시된 동일 모델을 사용하도록
+`HF_HUB_OFFLINE=1`을 설정했습니다.
+
+```bash
+set -a
+source .env
+set +a
+
+HF_HUB_OFFLINE=1 \
+uv run uvicorn rag_basic.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+일반적인 Query 요청 예시:
+
+```bash
+curl -X POST \
+  http://127.0.0.1:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "질문",
+    "top_k": 5
+  }'
+```
+
+#### 아직 수행하지 않은 작업
+
+- `POST /ingest`
+- PDF Upload API
+- OpenAI Generation
+- Ollama Generation
+- Answer + Source 최종 응답
+- Similarity Threshold API 적용
+- Reranking API 적용
+- DB Connection Pool
+- HNSW 및 IVFFlat
+- 인증
+- CORS
+- FastAPI Docker화
+- 외부 인터넷 배포
+- LangChain
+
+#### 다음 단계: POST /ingest
+
+다음 단계에서는 아직 구현하지 않은 문서 적재 API를 구성할 예정입니다.
+
+```text
+Document
+↓
+POST /ingest
+↓
+FastAPI
+↓
+Chunk
+↓
+Embedding
+↓
+PostgreSQL + pgvector
+```
+
+`/ingest` 이후 최종 RAG 단계에서는 다음 구조로 확장할 수 있습니다.
+
+```text
+POST /query
+↓
+Retrieval
+↓
+Context
+↓
+OpenAI / qwen3:8b
+↓
+Answer + Source
+```
+
+현재 `/query`는 Retrieval 결과와 Context를 반환하는 API이며 최종 자연어 Answer
+API는 아닙니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -2413,7 +2762,7 @@ JSON Response
 - [x] SQL Vector Search
 - [x] FAISS vs pgvector 비교
 - [x] FastAPI 기본 서버
-- [ ] POST `/query` Retrieval API
+- [x] POST `/query` Retrieval API
 - [ ] POST `/ingest`
 
 ## AI 도구 활용
