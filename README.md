@@ -1682,7 +1682,7 @@ FAISS는 Vector Search에 특화된 라이브러리입니다. PostgreSQL + pgvec
 데이터와 Vector를 DB에서 함께 관리하고 영속 저장할 수 있다는 차이가 있으며,
 FAISS가 잘못된 기술이라는 의미는 아닙니다.
 
-#### 아직 수행하지 않은 작업
+#### 적재 단계에서 수행하지 않은 작업
 
 - Query Embedding을 이용한 SQL Vector Search
 - `<=>` 기반 Top-K Retrieval
@@ -1706,7 +1706,7 @@ set +a
 uv run python -m rag_basic.pgvector_ingest
 ```
 
-#### 다음 단계
+#### 적재 다음 단계
 
 다음 단계는 **SQL Vector Search 구현**입니다.
 
@@ -1722,7 +1722,224 @@ ORDER BY embedding <=> query_embedding
 Top-5 Chunk
 ```
 
-현재는 Chunk와 Embedding 적재까지 완료했으며 SQL 검색은 아직 구현하지 않았습니다.
+이 적재를 마친 뒤 아래 단계에서 SQL Vector Search를 구현했습니다.
+
+### SQL Vector Search
+
+PostgreSQL에 이미 저장된 162개 Chunk Embedding은 다시 생성하지 않고, 사용자
+Query 하나만 Embedding한 뒤 pgvector의 cosine distance 연산으로 Top-5 Chunk를
+검색하도록 구현했습니다.
+
+```text
+User Query
+↓
+Query Embedding
+↓
+PostgreSQL + pgvector
+↓
+Cosine distance
+↓
+Top-5 Chunk
+↓
+build_context()
+```
+
+#### Query Embedding
+
+기존 Embedding 모델인 `intfloat/multilingual-e5-small`을 그대로 사용했습니다.
+문서 Chunk Vector는 DB에 저장되어 있으므로 검색할 때 다시 만들지 않고 질문
+하나만 Embedding합니다.
+
+E5 모델의 검색 규칙에 따라 기존 `embed_texts(..., "query")`를 재사용하여
+`query: ` prefix를 적용했습니다.
+
+```text
+Query Embedding shape: (1, 384)
+```
+
+#### pgvector SQL 검색
+
+핵심 검색 연산은 pgvector의 cosine distance 연산자 `<=>`입니다.
+
+```sql
+ORDER BY embedding <=> query_embedding
+LIMIT 5
+```
+
+Cosine distance는 작을수록 두 Vector의 방향이 비슷하므로 오름차순으로 정렬합니다.
+실제 Query Vector를 SQL 문자열에 직접 삽입하지 않고 parameterized query로
+전달했습니다.
+
+#### Distance와 Similarity
+
+두 값의 관계는 다음과 같습니다.
+
+```text
+cosine similarity = 1 - cosine distance
+```
+
+```text
+Cosine similarity
+→ 높을수록 유사
+
+Cosine distance
+→ 낮을수록 유사
+```
+
+pgvector 내부 검색은 distance를 기준으로 합니다. Python 결과의 `score`는 기존
+FAISS Retrieval 구조와 맞추기 위해 cosine similarity로 반환합니다.
+
+#### metadata filter
+
+DB에는 앞으로 다른 문서, Embedding 모델과 Chunking configuration도 저장할 수
+있습니다. 서로 다른 dataset이 검색에 섞이지 않도록 현재 baseline metadata를
+WHERE 조건으로 사용했습니다.
+
+- `document_name`: `ai_ethics_guide.pdf`
+- `embedding_model`: `intfloat/multilingual-e5-small`
+- `chunk_size`: `500`
+- `chunk_overlap`: `100`
+
+#### 검색 결과 구조와 Context 재사용
+
+pgvector 검색 결과는 기존 Retrieval 결과와 최대한 비슷한 `list[dict]` 구조로
+구성했습니다.
+
+```text
+rank
+score
+cosine_distance
+chunk_id
+page_number
+text
+```
+
+이 구조를 통해 기존 `build_context()`를 변경 없이 재사용했습니다.
+
+```text
+FAISS retrieve()
+        ↓
+    result dict
+        ↓
+build_context()
+
+pgvector search()
+        ↓
+    result dict
+        ↓
+build_context()
+```
+
+Retrieval backend가 달라져도 같은 Context 생성 로직을 사용할 수 있음을
+확인했습니다.
+
+#### 실제 검색 결과
+
+```text
+copyright_in_domain
+Top-5: [28, 39, 3, 93, 35]
+Gold Hit@5: True
+First gold rank: 1
+Context: 2305자
+
+creative_contribution_copyright
+Top-5: [28, 39, 30, 33, 31]
+Gold Hit@5: True
+First gold rank: 4
+Context: 2519자
+
+france_out_of_domain
+Top-5: [136, 102, 65, 108, 96]
+Context: 2501자
+```
+
+두 in-domain Case에서는 기존 evaluation gold Chunk가 Top-5에 존재하는지와 첫
+순위를 확인했습니다. 전체 Evaluation Case의 MRR을 다시 계산한 것은 아닙니다.
+
+#### OOD 검색의 의미
+
+France 질문도 Top-5 결과를 반환했습니다. 이는 오류가 아니라 Vector Search가
+현재 저장된 Vector 중 질문에 가장 가까운 후보를 반환하기 때문입니다.
+
+이번 단계에서는 Similarity Threshold, OOD classifier 및 LLM refusal을 적용하지
+않았습니다.
+
+```text
+Top-K 검색
+≠
+질문이 문서와 관련 있다는 판정
+```
+
+#### Exact Search
+
+현재 `rag_chunks.embedding`에는 HNSW나 IVFFlat Vector index가 없습니다. dataset이
+162개로 작기 때문에 이번 단계에서는 성능 최적화보다 pgvector SQL 검색 동작과
+결과 확인에 초점을 맞춰 exact nearest-neighbor search를 사용했습니다.
+
+HNSW 또는 IVFFlat을 구현하거나 성능을 검증한 단계는 아닙니다.
+
+#### 검증 결과
+
+```text
+DB Connection: 성공
+baseline rows: 162
+Query Embedding shape: (1, 384)
+
+각 Case:
+- Top-5 반환
+- rank 1~5
+- cosine distance 오름차순
+- cosine similarity 내림차순
+- score ≈ 1 - cosine_distance
+- build_context() 생성 성공
+```
+
+Embedding Vector 전체 숫자는 출력하거나 README에 기록하지 않았습니다.
+
+#### 실행 방법
+
+실제 password를 명령에 작성하지 않고 Git에서 제외된 `.env`를 환경변수로
+불러옵니다.
+
+```bash
+set -a
+source .env
+set +a
+
+uv run python -m rag_basic.pgvector_retrieval
+```
+
+#### 아직 수행하지 않은 작업
+
+- FAISS와 pgvector 정식 비교
+- 전체 Evaluation Case 비교
+- HNSW
+- IVFFlat
+- pgvector Retrieval과 LLM Generation 연결
+- FastAPI
+- LangChain
+
+일부 결과가 기존 FAISS 실행과 같아 보이더라도 두 backend가 완전히 동일하다고
+검증한 것은 아닙니다. 정식 비교는 다음 단계에서 수행합니다.
+
+#### 다음 단계
+
+다음 단계는 **FAISS vs pgvector 검색 결과 비교**입니다.
+
+```text
+                Query
+                  ↓
+          Query Embedding
+                  ↓
+        ┌─────────┴─────────┐
+        ↓                   ↓
+      FAISS             pgvector
+        ↓                   ↓
+      Top-5               Top-5
+        └─────────┬─────────┘
+                  ↓
+       rank / chunk / score 비교
+```
 
 ## 진행 상황
 
@@ -1744,7 +1961,7 @@ Top-5 Chunk
 - [x] Docker 환경 구성
 - [x] PostgreSQL + pgvector 실행
 - [x] Chunk + Embedding DB 적재
-- [ ] SQL Vector Search
+- [x] SQL Vector Search
 - [ ] FAISS vs pgvector 비교
 
 ## AI 도구 활용
