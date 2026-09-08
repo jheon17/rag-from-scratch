@@ -2173,6 +2173,223 @@ OpenAI / qwen3:8b
 Answer + Source
 ```
 
+## 11. 서비스화
+
+기존 프로젝트는 필요한 Python module을 터미널에서 직접 실행하는 구조였습니다.
+
+```text
+Terminal
+↓
+python module
+↓
+Retrieval / RAG 실행
+```
+
+FastAPI를 추가하는 목적은 기존 Python 기능을 HTTP API를 통해 다른 프로그램에서도
+호출할 수 있는 구조로 확장하는 것입니다. 현재 단계에서는 FastAPI 서버의 기본
+동작만 확인했으며, 기존 RAG 기능은 아직 API에 연결하지 않았습니다.
+
+### FastAPI 최소 서버
+
+FastAPI는 Python으로 HTTP API를 만들기 위한 웹 프레임워크입니다. 이번 단계에서는
+다음 Endpoint 하나만 구현했습니다.
+
+```text
+GET /health
+```
+
+응답은 다음과 같습니다.
+
+```json
+{
+  "status": "ok"
+}
+```
+
+현재 `/health`는 PostgreSQL, pgvector, Ollama, OpenAI 또는 GPU 상태를 검사하지
+않습니다. FastAPI 프로세스가 HTTP 요청을 받아 정상적으로 응답할 수 있는지만
+확인합니다.
+
+#### FastAPI와 Uvicorn의 역할
+
+```text
+FastAPI
+→ API endpoint 및 요청 처리 로직 정의
+
+Uvicorn
+→ FastAPI application을 실제 HTTP server로 실행
+```
+
+서버는 다음 명령으로 실행했습니다.
+
+```bash
+uv run uvicorn rag_basic.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+`127.0.0.1`은 localhost에만 bind합니다. 따라서 현재 서버는 인터넷에 공개된 API가
+아니라 이 컴퓨터 안에서만 접근하는 로컬 개발 및 검증용 API입니다.
+
+#### Dependency
+
+이번 단계에서 다음 dependency를 추가했습니다.
+
+```text
+fastapi>=0.141.1
+uvicorn[standard]>=0.52.4
+```
+
+실제 검증 당시 설치된 버전은 다음과 같습니다.
+
+```text
+fastapi==0.141.1
+uvicorn==0.52.4
+```
+
+#### 최소 API 코드
+
+최소 FastAPI application은 `src/rag_basic/api.py`에 구현했습니다.
+
+```python
+app = FastAPI(...)
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+```
+
+이번 단계에서는 `/health` 이외의 Endpoint를 추가하지 않았습니다.
+
+#### 실제 HTTP 검증
+
+실행 중인 서버에 다음 요청을 실제로 보냈습니다.
+
+```bash
+curl -i http://127.0.0.1:8000/health
+```
+
+응답:
+
+```text
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"status":"ok"}
+```
+
+HTTP status `200`은 서버가 요청을 정상적으로 처리했다는 의미입니다. 검증이 끝난
+뒤 테스트용 Uvicorn 프로세스를 정상 종료하고 port 8000이 해제된 것도
+확인했습니다.
+
+#### OpenAPI와 Swagger UI
+
+FastAPI는 코드에 정의된 API 정보를 바탕으로 OpenAPI schema를 자동 생성합니다.
+실제 schema에서 다음 내용을 확인했습니다.
+
+```text
+title: RAG from Scratch API
+version: 0.1.0
+/health path 존재: True
+GET method 존재: True
+```
+
+Swagger UI는 브라우저에서 Endpoint를 확인하고 직접 요청해 볼 수 있는 자동 생성
+문서 화면입니다.
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+#### 현재 구조
+
+현재 구현된 서비스 흐름은 다음과 같습니다.
+
+```text
+Client
+↓
+HTTP
+↓
+Uvicorn
+↓
+FastAPI
+↓
+GET /health
+```
+
+다음 Retrieval API 구조는 아직 구현 전입니다.
+
+```text
+POST /query
+↓
+FastAPI
+↓
+Query Embedding
+↓
+pgvector
+↓
+Top-K
+```
+
+#### 이번 단계에서 하지 않은 작업
+
+- `POST /query`
+- `POST /ingest`
+- PostgreSQL 연결
+- Query Embedding
+- pgvector Retrieval
+- `build_context()`
+- OpenAI
+- Ollama
+- LLM Generation
+- FastAPI Docker화
+- 외부 인터넷 배포
+- 인증
+- CORS
+- LangChain
+
+#### 실행 방법
+
+서버 실행:
+
+```bash
+uv run uvicorn rag_basic.api:app \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+```json
+{"status":"ok"}
+```
+
+#### 다음 단계: POST /query Retrieval API
+
+다음 단계에서는 다음 흐름의 Retrieval API를 구현할 예정입니다.
+
+```text
+POST /query
+↓
+FastAPI
+↓
+Query Embedding
+↓
+PostgreSQL + pgvector
+↓
+Top-5 Chunk
+↓
+JSON Response
+```
+
+이 단계에서도 LLM 답변 생성은 연결하지 않고 Retrieval 결과를 JSON으로 반환하는
+것까지만 구현할 예정입니다.
+
 ## 진행 상황
 
 - [x] PDF 로딩 및 텍스트 추출
@@ -2195,9 +2412,9 @@ Answer + Source
 - [x] Chunk + Embedding DB 적재
 - [x] SQL Vector Search
 - [x] FAISS vs pgvector 비교
-- [ ] FastAPI 서비스화
-- [ ] `/ingest`
-- [ ] `/query`
+- [x] FastAPI 기본 서버
+- [ ] POST `/query` Retrieval API
+- [ ] POST `/ingest`
 
 ## AI 도구 활용
 
