@@ -3483,11 +3483,175 @@ uv run uvicorn rag_basic.api:app \
   --port 8000
 ```
 
-### 다음 단계: 최종 RAG API Evaluation
+### 최종 RAG API Evaluation Baseline
 
-다음 12-2 단계에서는 기존 9개 Evaluation Case의 Retrieval 지표와 Generation
-기본 검증, Citation 유효성, OOD refusal 및 서로 다른 실제 PDF의 document
-filtering을 최종 서비스 경로에서 검증할 예정입니다. 아직 완료된 단계는 아닙니다.
+`src/rag_basic/api_evaluation.py`에서 기존 Python 함수를 직접 평가하는 대신 다음
+실제 서비스 경로 전체를 HTTP Response 기준으로 평가했습니다.
+
+```text
+Evaluation Script
+↓
+HTTP POST /query
+↓
+FastAPI
+↓
+PostgreSQL + pgvector
+↓
+Ollama qwen3:8b
+↓
+HTTP Response
+```
+
+기존 `EVAL_CASES`의 9개 질문과 gold evidence를 그대로 재사용했습니다.
+
+- In-domain: 6개
+- Out-of-domain: 3개
+
+평가 결과에 맞추기 위해 질문이나 `expected_chunk_ids`를 새로 만들거나 변경하지
+않았습니다.
+
+#### Retrieval 결과
+
+```text
+Hit@5: 6/6
+MRR: 0.8750
+```
+
+이는 기존 Python-level baseline의 Hit@5 `6/6`, MRR `0.8750`과 같았습니다.
+최종 HTTP → FastAPI → pgvector 경로에서도 기존 baseline Retrieval 동작이
+유지됐다는 의미로만 해석합니다.
+
+Case별 실제 Top-5 `chunk_id`는 다음과 같습니다.
+
+```text
+copyright_in_domain
+[28, 39, 3, 93, 35]
+
+creative_contribution_copyright
+[28, 39, 30, 33, 31]
+
+ai_assignment_submission
+[69, 68, 76, 70, 75]
+
+midjourney_contest_controversy
+[65, 74, 76, 53, 93]
+
+fake_news_damage_report
+[104, 99, 105, 7, 8]
+
+generative_ai_work_benefits
+[137, 13, 78, 138, 16]
+
+france_out_of_domain
+[136, 102, 65, 108, 96]
+
+solar_system_out_of_domain
+[146, 9, 36, 145, 155]
+
+triangle_out_of_domain
+[139, 74, 114, 75, 113]
+```
+
+#### Generation 자동 검증
+
+```text
+In-domain answer non-empty: 6/6
+In-domain citation present: 5/6
+In-domain citation number valid: 5/6
+OOD exact refusal: 3/3
+```
+
+기존 Generation baseline의 citation `6/6`과 달리 이번 HTTP API 평가에서는
+`5/6`이었습니다. Retrieval 결과가 유지됐지만 Generation 결과까지 자동으로
+동일하게 유지된 것은 아닙니다.
+
+#### Retrieval 성공, Generation 실패 Case
+
+`ai_assignment_submission`의 Retrieval 결과는 다음과 같습니다.
+
+```text
+expected gold: [68, 69, 70]
+Top-5: [69, 68, 76, 70, 75]
+first gold rank: 1
+```
+
+정답 근거 검색에는 성공했고, 답변이 인용한 Source 1의 `chunk_id=69`에도 생성형
+AI 결과물을 그대로 과제로 제출해서는 안 된다는 내용이 있었습니다. 그러나 생성
+답변에는 다음 refusal 문장이 포함됐습니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+Citation 번호 자체는 유효했지만 검색된 근거를 적절한 답변으로 활용하지 못했으므로
+이 Case는 Retrieval 성공, Generation 실패 사례로 기록합니다.
+
+`fake_news_damage_report`의 Retrieval 결과는 다음과 같습니다.
+
+```text
+expected gold: [104, 105]
+Top-5: [104, 99, 105, 7, 8]
+```
+
+gold evidence가 rank 1과 rank 3에 있었지만 Generation은 다음과 같이 거절했고
+Citation도 생성하지 않았습니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+이 Case도 Retrieval 성공, Generation 실패 사례입니다.
+
+#### Citation 평가의 한계
+
+`ai_assignment_submission`은 Citation 번호가 실제 Retrieval result 범위에 있었지만
+답변 내용은 적절하지 않았습니다. 따라서 이번 결과에서 다음 세 항목은 서로 같은
+의미가 아님을 확인했습니다.
+
+```text
+Citation 존재 및 번호 유효
+≠ Citation faithfulness
+≠ Answer correctness
+```
+
+현재 자동 검증은 Citation 존재와 Source 번호 범위만 확인합니다. 자동
+faithfulness 또는 answer correctness 평가가 아닙니다.
+
+#### OOD 결과
+
+다음 세 문서 밖 질문은 모두 지정된 문장으로 정확히 거절됐습니다.
+
+- 프랑스의 수도
+- 태양계에서 가장 큰 행성
+- 삼각형 내각의 합
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+따라서 OOD exact refusal은 `3/3`이었습니다. 현재 Vector Search에는 similarity
+threshold가 적용되지 않아 OOD 질문에도 nearest Top-5 Retrieval 결과가 존재할 수
+있습니다. 이 평가에서는 해당 Context를 보고 Generation이 답변을 거절하는지를
+확인했습니다.
+
+#### 이번 평가에서 확인한 점
+
+Retrieval 지표가 유지돼도 최종 Generation 품질이 자동으로 보장되지는 않습니다.
+또한 단순히 답변이 비어 있지 않거나 Citation이 존재한다는 사실만으로 RAG 답변
+품질을 충분히 평가하기 어렵다는 점을 실제 Case에서 확인했습니다.
+
+### 다음 단계: Local LLM Generation 재현성 및 실패 원인 분석
+
+다음 12-2B 단계에서는 먼저 다음 항목을 확인할 예정입니다.
+
+- 동일 질문 반복 실행
+- Generation output 변동 확인
+- Ollama sampling 설정 확인
+- 재현 가능한 Generation 설정 검토
+
+이 확인 후에도 같은 실패가 유지될 경우에만 Prompt를 최소 수정하고 변경 전후
+결과를 비교할 예정입니다. 아직 temperature, seed 또는 Prompt를 변경한 상태는
+아닙니다.
 
 ## 진행 상황
 
@@ -3516,7 +3680,8 @@ filtering을 최종 서비스 경로에서 검증할 예정입니다. 아직 완
 - [x] POST `/ingest` PDF Upload API
 - [x] Document-aware `/query`
 - [x] pgvector Retrieval + qwen3:8b Generation
-- [ ] 최종 RAG API Evaluation
+- [x] 최종 RAG API Evaluation Baseline
+- [ ] Local LLM Generation 재현성 및 실패 원인 분석
 
 ## AI 도구 활용
 
