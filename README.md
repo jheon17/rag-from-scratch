@@ -4020,20 +4020,168 @@ Generation 품질
 즉 Retrieval과 Generation randomness를 분리한 뒤에도 Generation 품질 문제가
 남아 있음을 확인했습니다.
 
-### 다음 단계: Context Ablation
+### Context Ablation
 
-12-2C-2에서는 동일한 질문에 전달하는 Context만 다음과 같이 바꿔 비교할
-예정입니다.
+12-2C-2에서는 `ai_assignment_submission`의 Generation 실패가 여러 Retrieval
+Source의 조합과 관련 있는지 확인했습니다. Prompt, Query, 모델과 Generation
+설정은 유지하고 Context 구성만 바꿔 비교했습니다.
 
 ```text
-A. Source 1만 사용
-B. gold Source들만 사용
-C. 기존 Top-5 전체 사용
+model: qwen3:8b
+temperature: 0
+seed: 42
 ```
 
-이 비교의 목적은 정답 Source 하나만 있어도 refusal하는지, 여러 Source가 함께
-있을 때 refusal하는지를 구분하는 것입니다. Context Ablation은 아직 수행하지
+최초 실제 `/query`의 Retrieval 결과는 다음과 같았습니다.
+
+```text
+Top-5 chunk_id: [69, 68, 76, 70, 75]
+기존 Top-5와 동일: True
+```
+
+실제 `/query`를 한 번 호출해 Retrieval 결과를 확보한 뒤, 동일한 Retrieval
+result에서 Context에 포함할 Source만 바꿔 Local Generation을 직접 호출했습니다.
+
+```text
+실제 POST /query
+→ Top-5 Retrieval 확보
+→ 동일 Query / 동일 Prompt template
+→ Context subset만 변경
+→ qwen3:8b Generation
+```
+
+이 direct Generation은 Production API를 대체하기 위한 것이 아니라, Context라는
+변수의 영향만 분리하기 위한 ablation입니다.
+
+비교한 세 조건과 각 조건의 Chunk는 다음과 같습니다.
+
+```text
+SOURCE_1_ONLY
+chunk_id: [69]
+
+GOLD_ONLY
+chunk_id: [69, 68, 70]
+
+FULL_TOP_5
+chunk_id: [69, 68, 76, 70, 75]
+```
+
+각 Condition은 세 번씩 반복했습니다.
+
+| Condition | Chunk | NO_ANSWER 포함 | Exact NO_ANSWER | Unique answers | Citation 유효 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SOURCE_1_ONLY | `[69]` | 0/3 | 0/3 | 1 | 3/3 |
+| GOLD_ONLY | `[69, 68, 70]` | 3/3 | 0/3 | 1 | 3/3 |
+| FULL_TOP_5 | `[69, 68, 76, 70, 75]` | 3/3 | 0/3 | 1 | 3/3 |
+
+#### SOURCE_1_ONLY 결과
+
+세 번 모두 다음과 같이 직접 답했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되지 않습니다. [Source 1]
+```
+
+Source 1 단독 Context에서는 현재 Prompt와 `qwen3:8b`가 직접적인 근거를 답변에
+활용하는 행동이 관찰됐습니다. 이것이 자동 answer correctness 평가를 통과했다는
+의미는 아닙니다.
+
+#### GOLD_ONLY 결과
+
+gold evidence만 남긴 `[69, 68, 70]`에서도 세 번 모두 refusal 문구를
+포함했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+제공된 문서에서 확인할 수 없습니다.
+
+[Source 1]
+```
+
+따라서 non-gold Chunk를 제거하는 것만으로 Generation 실패가 사라지지는
 않았습니다.
+
+#### FULL_TOP_5 결과
+
+기존 `[69, 68, 76, 70, 75]`에서도 세 번 모두 refusal 문구를 포함했습니다.
+
+```text
+Source 1 only → 직접 답변
+Gold only → refusal
+Full Top-5 → refusal
+```
+
+이번 실험에서는 위와 같은 Context-dependent behavior가 관찰됐습니다.
+
+#### 결과 해석
+
+이번 결과로 다음 단순 가설은 약해졌습니다.
+
+```text
+non-gold Chunk 76, 75가 존재하기 때문에 Generation이 실패한다
+```
+
+non-gold Chunk를 모두 제거한 GOLD_ONLY에서도 refusal이 유지됐기 때문입니다.
+하지만 아직 `chunk_id=68`, `chunk_id=70`, 여러 gold Chunk의 조합, Prompt,
+`qwen3:8b` 또는 Context 길이가 원인이라고 확정하지 않습니다. 현재 확인할 수 있는
+범위는 Context 구성에 따른 refusal behavior 차이가 존재한다는 점입니다.
+
+#### HTTP와 Direct Generation 비교
+
+FULL_TOP_5 direct Generation과 최초 HTTP `/query` 답변은 exact string 기준으로
+세 번 모두 동일하지 않았습니다.
+
+```text
+FULL_TOP_5 direct answer matches HTTP answer: False
+```
+
+두 결과 모두 refusal 문구를 포함했지만 Citation 구성에 차이가 있었습니다.
+`temperature=0`, `seed=42` 적용 후 반복 결과가 이전보다 안정됐다는 관찰과는
+별개로, 모든 호출 경로에서 완전한 문자열 동일성이 보장된다고 일반화할 수
+없습니다.
+
+현재까지의 원인 분해는 다음과 같습니다.
+
+```text
+Retrieval
+→ gold rank 1
+
+Source 1 단독
+→ 직접 답변
+
+Gold Source 여러 개
+→ refusal
+
+Full Top-5
+→ refusal
+```
+
+따라서 다음 단계에서는 gold Source 사이의 상호작용을 더 세분화해 확인할
+필요가 있습니다.
+
+### 다음 단계: Gold Source Interaction Ablation
+
+12-2C-3에서는 다음 조건을 비교할 예정입니다.
+
+```text
+A. Source 1 only
+B. Source 1 + Source 2
+C. Source 1 + Source 4
+D. Source 1 + Source 2 + Source 4
+```
+
+현재 Source와 Chunk의 연결은 다음과 같습니다.
+
+```text
+Source 1 = chunk 69
+Source 2 = chunk 68
+Source 4 = chunk 70
+```
+
+어떤 Source가 Source 1에 추가될 때 refusal behavior가 발생하는지 분리하는 것이
+목적입니다. 또한 HTTP response의 Context와 동일 Retrieval result로 재구성한
+Context가 exact string으로 같은지, 최종 Prompt도 동일한지 확인할 예정입니다.
+이 실험은 아직 수행하지 않았습니다.
 
 ## 진행 상황
 
@@ -4066,7 +4214,8 @@ C. 기존 Top-5 전체 사용
 - [x] Local LLM Generation 변동성 Baseline
 - [x] Generation 재현성 설정 비교
 - [x] Generation 실패 원인 진단
-- [ ] Context Ablation
+- [x] Context Ablation
+- [ ] Gold Source Interaction Ablation
 
 ## AI 도구 활용
 
