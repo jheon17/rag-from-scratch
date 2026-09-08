@@ -4809,25 +4809,216 @@ Length-matched duplicate 100자
 → refusal 4/5
 ```
 
-#### 다음 단계: Near-Duplicate Context Filtering Experiment
+### Near-Duplicate Context Filtering Experiment
 
-12-2C-7에서는 synthetic Context 조작을 넘어, 실제 Top-5 Retrieval 결과에서
-이미 선택된 Source와 높은 text overlap을 가지는 후순위 Source를 Context 구성
-단계에서 제외했을 때 Generation behavior가 개선되는지 확인할 예정입니다.
+이전 Length-Matched Duplicate Control 실험에서는 다음 결과가 관찰됐습니다.
 
 ```text
-Actual Top-5 Retrieval
-→ 원본 Context 생성
+Length-matched duplicate 100자
+→ refusal 4/5
 
-Actual Top-5 Retrieval
-→ 이미 선택된 Source와 높은 text overlap을 가지는 후순위 Source를
-  diagnostic 단계에서 제외
-→ filtered Context 생성
+Length-matched non-duplicate control 100자
+→ refusal 0/5
 ```
 
-이는 Retrieval 결과 자체를 바꾸는 실험이 아닙니다. 두 Context에 동일한 Query,
-Prompt, model 설정을 사용해 Generation을 비교할 예정이며, 아직 Production 코드를
-변경하거나 필터를 최종 기능으로 채택한 것은 아닙니다.
+12-2C-7에서는 synthetic text 조작을 넘어 실제 Top-5 Retrieval 결과를 그대로
+사용하면서, 후순위 near-duplicate Source만 LLM Context에서 diagnostic하게
+제외했습니다. 즉 Retrieval 결과 자체는 변경하지 않고 Context selection만
+비교했습니다.
+
+실행 설정은 다음과 같습니다.
+
+```text
+model: qwen3:8b
+temperature: 0
+seed: 42
+NEAR_DUPLICATE_THRESHOLD: 0.90
+REPEAT_COUNT: 5
+```
+
+#### 실제 Retrieval
+
+```text
+rank=1, chunk_id=69, page=33, score=0.921054, gold=True,  length=500
+rank=2, chunk_id=68, page=33, score=0.920334, gold=True,  length=500
+rank=3, chunk_id=76, page=35, score=0.902314, gold=False, length=412
+rank=4, chunk_id=70, page=33, score=0.902033, gold=True,  length=102
+rank=5, chunk_id=75, page=35, score=0.898312, gold=False, length=500
+```
+
+```text
+Retrieved chunk_ids:
+[69, 68, 76, 70, 75]
+```
+
+이 목록은 필터 전후 동일한 Retrieval 결과입니다.
+
+#### Diagnostic filter 규칙
+
+Rank가 높은 Source부터 보존하면서 후순위 candidate와 이미 유지된 Source 사이의
+exact boundary overlap을 확인했습니다. Candidate coverage는 다음과 같이
+계산했습니다.
+
+```text
+candidate coverage = overlap length / candidate text length
+```
+
+Diagnostic threshold `0.90`은 candidate text의 거의 전부가 상위 Source와
+겹치는지 확인하기 위한 이번 Case의 진단 기준입니다. 최적 threshold나 Production
+최종값을 의미하지 않습니다.
+
+#### 실제 Filter 결과
+
+```text
+Original ranks: [1, 2, 3, 4, 5]
+Original chunk_ids: [69, 68, 76, 70, 75]
+
+Filtered ranks: [1, 2, 3, 5]
+Filtered chunk_ids: [69, 68, 76, 75]
+
+Dropped ranks: [4]
+Dropped chunk_ids: [70]
+```
+
+Source 4를 제외한 진단 근거는 다음과 같습니다.
+
+```text
+candidate Source: 4
+chunk_id: 70
+
+matched kept Source: 1
+
+forward overlap: 100
+reverse overlap: 0
+overlap length: 100
+candidate length: 102
+
+coverage: 0.980392
+threshold: 0.90
+
+decision:
+DROP as near-duplicate
+```
+
+나머지 주요 판정은 다음과 같습니다.
+
+```text
+Source 2 vs Source 1
+coverage = 0.200000
+→ KEEP
+
+Source 3 maximum coverage
+= 0.000000
+→ KEEP
+
+Source 5 maximum coverage
+= 0.200000
+→ KEEP
+```
+
+#### Gold evidence와 Context 변화
+
+```text
+Original gold: [69, 68, 70]
+Original gold count: 3
+
+Filtered gold: [69, 68]
+Filtered gold count: 2
+
+At least one gold remains: True
+```
+
+Source 4도 gold evidence였지만 필터 후에는 다른 gold evidence인 chunk 69와 68이
+남았습니다. 이 결과가 gold evidence 제거가 일반적으로 안전하다는 의미는 아닙니다.
+
+```text
+Original Source count: 5
+Filtered Source count: 4
+
+Original Context length: 2197
+Filtered Context length: 2058
+
+Original Prompt length: 2467
+Filtered Prompt length: 2328
+```
+
+Filtered Context에서는 Source 번호를 다시 할당하지 않아 original rank인
+`Source 1`, `Source 2`, `Source 3`, `Source 5`를 그대로 유지했습니다.
+
+#### Generation 결과
+
+| Condition | NO_ANSWER 포함 | Exact NO_ANSWER | Unique answers | Citation 유효 |
+| --- | ---: | ---: | ---: | ---: |
+| ORIGINAL_TOP_5 | 5/5 | 0/5 | 1 | 5/5 |
+| FILTERED_CONTEXT | 0/5 | 0/5 | 1 | 5/5 |
+
+Original Top-5 Context에서는 5회 모두 부적절한 refusal 문구를 포함했습니다.
+
+```text
+Original refusal count: 5/5
+```
+
+Filtered Context에서는 5회 모두 직접 답변했습니다. 대표 답변은 다음과 같습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+그대로 제출해서는 안 됩니다. 생성형 AI를 활용해 과제의 아이디어를 얻거나 보고서 개요와 초안을 만들거나 번역, 사례 수집 등 보조적으로만 활용해야 하며, 최종 과제 보고서의 완성은 학습자 본인이 직접 해야 합니다. [Source 1]
+```
+
+```text
+Filtered refusal count: 0/5
+```
+
+핵심 비교는 다음과 같습니다.
+
+```text
+Original Top-5
+→ refusal 5/5
+
+Near-duplicate Source 4 제외 Context
+→ refusal 0/5
+```
+
+현재 Case와 실행환경에서는 near-duplicate Source를 Context에서 제외한 조건에서
+refusal behavior가 감소했습니다.
+
+다만 Top-5 Retrieval 자체는 바뀌지 않았으므로 Hit@5, MRR 또는 Retrieval 품질이
+개선됐다고 해석하지 않습니다. 변경된 것은 LLM에 전달하는 Context selection뿐입니다.
+
+또한 near-duplicate filtering을 최종 해결책으로 확정하거나, `0.90`이 최적
+threshold이거나 Production에 바로 적용해야 한다고 판단하지 않습니다. Chunking이나
+qwen3:8b 자체가 문제라고도 단정하지 않습니다. 이번 결과는 특정 Case와 현재
+실행환경에서 near-duplicate Context filtering이 Generation failure 감소와 함께
+관찰된 diagnostic practical evidence입니다.
+
+이번 단계로 `ai_assignment_submission` 단일 Case의 세부 원인 분해는 종료합니다.
+Overlap 80자·60자 비교, 특정 문장 삭제, token 단위 분해와 같은 더 작은 ablation은
+추가하지 않고 전체 Evaluation으로 돌아갑니다.
+
+#### 다음 단계: Full Evaluation with Near-Duplicate Context Filtering
+
+12-2D에서는 기존 전체 9개 Evaluation Case에 동일한 diagnostic near-duplicate
+filtering rule을 적용해 Generation 개선 여부와 다른 Case의 regression 여부를
+확인할 예정입니다.
+
+```text
+기존 Final RAG API baseline
+
+vs
+
+동일 Retrieval 결과
++
+near-duplicate Context filtering
+```
+
+검증 범위는 다음과 같습니다.
+
+- 6개 in-domain: Retrieval Hit@5/MRR, Generation answer, Citation, refusal behavior
+- 3개 out-of-domain: exact refusal 유지 여부
+- Context filter: 제거된 Source 수와 제거가 발생한 Case
+
+아직 Production filtering은 구현하지 않으며, 전체 9개 평가에서 regression 여부를
+먼저 확인합니다.
 
 ## 진행 상황
 
@@ -4865,7 +5056,8 @@ Prompt, model 설정을 사용해 Generation을 비교할 예정이며, 아직 P
 - [x] Source 4 Content Diagnosis
 - [x] Duplicate Context Ablation
 - [x] Length-Matched Duplicate Control Ablation
-- [ ] Near-Duplicate Context Filtering Experiment
+- [x] Near-Duplicate Context Filtering Experiment
+- [ ] Full Evaluation with Near-Duplicate Context Filtering
 
 ## AI 도구 활용
 
