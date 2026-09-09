@@ -1,0 +1,15 @@
+.git
+.venv
+.env
+
+__pycache__
+*.pyc
+*.pyo
+
+data/*.pdf
+*.pdf
+
+build
+dist
+
+/tmp

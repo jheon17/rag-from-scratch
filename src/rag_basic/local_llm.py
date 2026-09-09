@@ -1,11 +1,15 @@
 """Python 표준 라이브러리로 Ollama Local API를 호출한다."""
 
 import json
+import os
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://localhost:11434/api/chat",
+)
 LOCAL_MODEL_NAME = "qwen3:8b"
 LOCAL_TEMPERATURE = 0
 LOCAL_SEED = 42

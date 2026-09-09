@@ -5637,23 +5637,359 @@ Generation 경로가 문서 간 혼입 없이 동작하는지 확인한 integrat
 검증 또는 `0.90` threshold의 최적성을 의미하지 않습니다. 이번 단계의 검증 범위는
 두 실제 PDF로 제한됩니다.
 
-#### 다음 단계: 13. FastAPI Dockerization
+### FastAPI Dockerization
 
-다음 단계에서는 현재 host에서 직접 실행 중인 FastAPI 서비스를 Docker image와
-container로 실행할 수 있게 구성합니다. 기존 Docker PostgreSQL과 연결해 `/health`,
-`/query`, `/ingest`가 컨테이너 환경에서도 동작하는지 검증할 예정입니다.
-
-Ollama는 우선 host에서 계속 실행합니다. 이번 프로젝트에서는 GPU container나 Ollama
-container까지 확장하기보다 FastAPI와 PostgreSQL의 서비스 경계를 검증하는 데
-집중합니다.
-
-이후의 큰 흐름은 다음과 같습니다.
+기존에는 PostgreSQL만 Docker에서 실행하고 FastAPI와 Ollama는 Ubuntu Host에서
+실행했습니다. 이번 단계에서는 FastAPI도 container로 옮겨 다음 구조를 구성했습니다.
 
 ```text
-FastAPI Dockerization
-→ Final README 정리
-→ 프로젝트 마무리
+기존
+PostgreSQL          → Docker
+FastAPI             → Host Uvicorn
+Ollama qwen3:8b     → Host GPU
+
+변경 후
+FastAPI             → Docker container
+PostgreSQL + pgvector → Docker container
+Ollama qwen3:8b     → Ubuntu Host GPU
 ```
+
+최종 아키텍처는 다음과 같습니다.
+
+```text
+Client
+  ↓
+FastAPI Container
+  ├─ Query Embedding
+  ├─ pgvector Retrieval
+  ├─ Context Selection
+  └─ RAG Prompt
+        │
+        ├──── PostgreSQL Container
+        │       └─ pgvector
+        │
+        └──── Host Ollama
+                └─ qwen3:8b
+                   └─ NVIDIA GPU
+```
+
+FastAPI container는 검색과 Prompt 구성까지 담당하고, 실제 LLM inference는 Host
+Ollama가 담당합니다. 이처럼 API runtime과 GPU Generation을 분리했습니다.
+
+#### Container networking
+
+Container 안의 `localhost`는 Ubuntu Host가 아니라 해당 container 자신을 의미합니다.
+따라서 PostgreSQL과 Ollama의 주소를 각각 실행 위치에 맞게 분리했습니다.
+
+```text
+POSTGRES_HOST=postgres
+POSTGRES_PORT=5432
+
+OLLAMA_URL=http://host.docker.internal:11434/api/chat
+```
+
+PostgreSQL은 Compose service 이름인 `postgres`로 연결합니다. Linux Docker에서 Host
+Ollama에 연결하기 위해서는 `host.docker.internal:host-gateway` 매핑을 사용했습니다.
+
+`local_llm.py`에서는 기존 Host 실행을 보존하면서 Ollama URL만 환경변수로 덮어쓸 수
+있게 변경했습니다.
+
+```text
+Host 기본값: http://localhost:11434/api/chat
+Docker:      http://host.docker.internal:11434/api/chat
+```
+
+따라서 같은 코드를 Host Python과 Docker FastAPI에서 모두 사용할 수 있습니다.
+
+#### Ollama Host 연결
+
+초기 검증에서는 Host Ollama가 `127.0.0.1:11434`에만 listen하고 있어 container에서
+접근할 수 없었습니다. Dockerized FastAPI가 접근할 수 있도록 systemd drop-in에 다음
+환경변수를 적용했습니다.
+
+```text
+OLLAMA_HOST=0.0.0.0:11434
+```
+
+변경 후 확인한 상태는 다음과 같습니다.
+
+```text
+Ollama service: active
+listener: *:11434
+Host localhost access: 정상
+Container → Host Ollama: 정상
+qwen3:8b 확인: True
+```
+
+`0.0.0.0`은 모든 Host network interface에 bind한다는 의미입니다. 현재 구성은 로컬
+개발 환경에서 검증한 것으로, 외부 네트워크에 노출되는 환경에서는 방화벽과 접근 제어를
+별도로 검토해야 합니다.
+
+#### Dockerfile과 build context
+
+최종 Dockerfile은 다음 구조를 사용합니다.
+
+```text
+Python 3.12 slim
+uv 0.12.9
+multi-stage build
+CPU-only PyTorch runtime
+Embedding model preload
+runtime offline Hugging Face cache
+```
+
+Runtime command는 다음과 같습니다.
+
+```text
+uvicorn rag_basic.api:app
+--host 0.0.0.0
+--port 8000
+```
+
+`.dockerignore`에서는 다음 항목을 image build context에서 제외했습니다.
+
+```text
+.git
+.venv
+.env
+Python cache
+PDF 원본
+build/dist
+```
+
+이를 통해 secret, Host virtualenv, 실습 PDF 원본이 image에 포함되지 않도록 했습니다.
+
+#### Image size 진단
+
+최초 Docker image는 `10,187,622,776 bytes`, 약 10.19 GB였습니다. 기능은 정상
+동작했지만 FastAPI container의 역할에 비해 지나치게 큰 크기였습니다.
+
+Image 내부를 조사한 결과 주요 용량은 다음과 같았습니다.
+
+```text
+NVIDIA / CUDA libraries: 약 3.2 GB
+Torch:                   약 1.1 GB
+Triton:                  약 894 MB
+multilingual-e5-small:   약 471 MB
+```
+
+초기 container의 PyTorch 상태는 다음과 같았습니다.
+
+```text
+torch = 2.14.0+cu130
+torch.version.cuda = 13.0
+torch.cuda.is_available() = False
+```
+
+CUDA Torch와 NVIDIA library가 설치돼 있었지만 FastAPI container에는 GPU device를
+전달하지 않았기 때문에 Embedding은 실제로 CPU에서 실행되고 있었습니다.
+
+현재 역할은 다음과 같이 분리돼 있습니다.
+
+```text
+FastAPI Container → Query / PDF Embedding → CPU
+Host Ollama       → qwen3:8b Generation   → GPU
+```
+
+따라서 FastAPI container에서는 CUDA dependency를 제거하고 CPU-only PyTorch를
+사용하는 것이 현재 구조에 더 적합하다고 판단했습니다. Embedding model을 더 작은
+모델로 교체한 것은 아니며, 기존 `intfloat/multilingual-e5-small`과 384차원 Vector를
+계속 사용합니다.
+
+#### Host와 Docker dependency 분리
+
+처음에는 `pyproject.toml`과 `uv.lock`에 `docker-cpu` optional extra를 추가해 Host
+CUDA와 Docker CPU dependency를 분리하려 했습니다. 하지만 실제 dependency
+resolution에서 기본 Host 환경까지 CPU Torch를 선택했기 때문에 해당 변경은
+rollback했습니다.
+
+대신 Host dependency graph는 유지하고 Docker artifact 생성 과정에서만 CPU Torch로
+교체하는 방식을 사용했습니다.
+
+```text
+Builder
+→ 기존 lock으로 dependency 설치
+→ Docker 내부에서만 Torch CPU wheel로 교체
+→ nvidia-* 제거
+→ Triton 제거
+→ dependency check
+→ Embedding model preload
+
+Runtime
+→ 정리된 .venv만 복사
+→ Hugging Face model cache만 복사
+```
+
+Multi-stage build를 사용하므로 Runtime image에는 `uv`, uv cache, Builder dependency
+layer가 포함되지 않습니다.
+
+#### CPU Runtime과 Offline Embedding 검증
+
+최종 Runtime image에서 확인한 PyTorch 상태는 다음과 같습니다.
+
+```text
+torch: 2.14.0+cpu
+torch.version.cuda: None
+torch.cuda.is_available(): False
+nvidia packages: []
+triton installed: False
+```
+
+네트워크 없이도 기존 Embedding model을 불러와 Vector를 생성했습니다.
+
+```text
+model: intfloat/multilingual-e5-small
+device: cpu
+embedding shape: (1, 384)
+offline embedding encode: 성공
+```
+
+Embedding model 자체는 변경하지 않았습니다.
+
+#### Image size 최적화 결과
+
+| 항목 | 크기 |
+| --- | ---: |
+| 초기 Docker image | `10,187,622,776 bytes` |
+| CPU runtime image | `2,576,568,589 bytes` |
+| 절감 | `7,611,054,187 bytes` |
+| 절감률 | `74.71%` |
+
+Docker image는 약 10.19 GB에서 약 2.58 GB로, 약 74.7% 감소했습니다.
+
+Docker image를 최적화한 뒤에도 Host `.venv`는 변경하지 않았습니다.
+
+```text
+Host torch: 2.14.0+cu130
+Host torch.version.cuda: 13.0
+```
+
+즉 Host GPU 개발 환경과 Docker CPU runtime을 서로 분리했습니다.
+
+#### Host와 Docker 입력 동등성 검증
+
+Dockerization 과정에서 과제 제출 질문의 Generation 결과가 한 차례 달라져 Host와
+Docker가 LLM에 전달하는 입력을 직접 비교했습니다.
+
+```text
+Retrieval chunk_ids identical: True
+Context Source ranks identical: True
+Context length: 2058 / 2058
+Context SHA256 identical: True
+Prompt length: 2328 / 2328
+Prompt SHA256 identical: True
+```
+
+```text
+Context SHA256:
+77d36926248fb0fea9c6ea4da1474e18d50d01e05d855cecdad1519622507407
+
+Prompt SHA256:
+5d01ecc92a4f22d3e54190b9fb3d81a62b38d27ff82d756dfa33d377d4f32c83
+```
+
+동일 Prompt를 Host와 Docker에서 각각 5회 직접 Generation한 결과도 같았습니다.
+
+```text
+Host:
+undesired refusal 0/5
+Exact refusal 0/5
+Unique answers 1
+
+Docker:
+undesired refusal 0/5
+Exact refusal 0/5
+Unique answers 1
+```
+
+다만 과거 별도 실행에서 Generation variability가 관찰된 적이 있으므로 Ollama가
+완전히 deterministic하거나 Docker가 Generation에 절대 영향을 주지 않는다고
+일반화하지 않습니다.
+
+#### 최종 Compose 통합 검증
+
+최적화된 CPU Runtime image를 실제 Compose API service에 적용한 뒤 다음 전체 경로가
+정상 동작하는 것을 확인했습니다.
+
+```text
+FastAPI Container
+→ PostgreSQL Container
+→ pgvector Retrieval
+
+FastAPI Container
+→ Host Ollama
+→ qwen3:8b Generation
+```
+
+검증 중 PostgreSQL과 API container는 `healthy`, Ollama는 `active` 상태였습니다.
+
+기존 DB를 재적재하거나 초기화하지 않았으며 최종 행 수도 유지됐습니다.
+
+```text
+ai_ethics_guide.pdf: 162 rows
+nist.ai.100-1.pdf: 275 rows
+```
+
+API endpoint의 최종 검증 결과는 다음과 같습니다.
+
+```text
+/health           → 200 OK
+정상 /query       → 200 OK
+duplicate /ingest → 409 Conflict
+top_k=0           → 422 Unprocessable Entity
+unknown document  → 404 Not Found
+/openapi.json      → 200 OK
+```
+
+최종 OpenAPI에서도 `/health`, `/query`, `/ingest` endpoint가 모두 유지됐습니다.
+
+Dockerized API는 단독 Query 검증 2건과 기존 API Evaluation 9건을 합쳐 `/query`
+요청 11건을 처리했으며, 모든 정상 Query request가 HTTP 200을 반환했습니다. 이
+검증에서는 별도로 확인되지 않은 Generation metric을 추가로 해석하지 않았습니다.
+
+API log에서는 traceback, secret 출력, 자동 restart loop가 없음을 확인했습니다.
+
+최종 검증 후에는 API만 정상적으로 정지하고 PostgreSQL과 Host Ollama는 유지했습니다.
+
+```text
+rag-api: 정상 stop
+8000: listener 없음
+rag-postgres: 계속 실행, healthy
+Ollama: active
+11434: 정상 listening
+PostgreSQL volume: 유지
+```
+
+이번 단계로 FastAPI Dockerization을 완료했으며, 현재 프로젝트 범위에서는 추가 Docker
+최적화를 진행하지 않습니다. Ollama GPU container화, Kubernetes, Docker Swarm,
+실제 AWS 배포는 이번 범위에 포함하지 않았습니다.
+
+이번 결과는 로컬 Ubuntu 환경에서 Dockerized FastAPI, Docker PostgreSQL, Host
+Ollama의 통합 동작을 검증한 것입니다. Production-ready 상태, 무중단 운영, 대규모
+트래픽, 모든 환경에서의 재현성을 검증한 것은 아닙니다.
+
+#### 다음 단계: 14. Final README 정리
+
+현재 README는 학습 기록과 실험 로그를 모두 포함해 매우 길어졌습니다. 다음 단계에서는
+채용 담당자나 면접관이 프로젝트의 핵심을 빠르게 이해할 수 있는 포트폴리오 README로
+재구성합니다.
+
+```text
+Problem
+Architecture
+Tech Stack
+Core Implementation
+Evaluation
+Failure Diagnosis
+Production Context Deduplication
+Multi-Document Verification
+Dockerization
+Image Optimization
+How to Run
+Limitations
+```
+
+위 내용을 중심으로 중복된 학습 로그를 압축할 예정이며, 아직 완료된 작업은 아닙니다.
 
 ## 진행 상황
 
@@ -5695,7 +6031,7 @@ FastAPI Dockerization
 - [x] Full Evaluation with Near-Duplicate Context Filtering
 - [x] Production Context Deduplication 적용
 - [x] Second PDF Multi-Document Verification
-- [ ] FastAPI Dockerization
+- [x] FastAPI Dockerization
 - [ ] Final README 정리
 
 ## AI 도구 활용
