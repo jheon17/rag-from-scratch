@@ -4995,30 +4995,229 @@ qwen3:8b 자체가 문제라고도 단정하지 않습니다. 이번 결과는 �
 Overlap 80자·60자 비교, 특정 문장 삭제, token 단위 분해와 같은 더 작은 ablation은
 추가하지 않고 전체 Evaluation으로 돌아갑니다.
 
-#### 다음 단계: Full Evaluation with Near-Duplicate Context Filtering
+### Full Evaluation with Near-Duplicate Context Filtering
 
-12-2D에서는 기존 전체 9개 Evaluation Case에 동일한 diagnostic near-duplicate
-filtering rule을 적용해 Generation 개선 여부와 다른 Case의 regression 여부를
-확인할 예정입니다.
+이전 단일 Case 실험의 `ai_assignment_submission`에서는 다음 변화가 관찰됐습니다.
 
 ```text
-기존 Final RAG API baseline
+Original Top-5 Context
+→ refusal 5/5
 
-vs
-
-동일 Retrieval 결과
-+
-near-duplicate Context filtering
+near-duplicate Source 4 제외
+→ refusal 0/5
 ```
 
-검증 범위는 다음과 같습니다.
+단일 Case 결과만으로 filtering을 채택할 수는 없으므로, 12-2D에서는 기존 전체
+9개 Evaluation Case에 같은 diagnostic rule을 적용해 Generation 개선 여부와
+다른 Case의 regression, OOD refusal 유지, gold evidence 보존 및 Citation 변화를
+확인했습니다.
 
-- 6개 in-domain: Retrieval Hit@5/MRR, Generation answer, Citation, refusal behavior
-- 3개 out-of-domain: exact refusal 유지 여부
-- Context filter: 제거된 Source 수와 제거가 발생한 Case
+실행 설정은 다음과 같습니다.
 
-아직 Production filtering은 구현하지 않으며, 전체 9개 평가에서 regression 여부를
-먼저 확인합니다.
+```text
+model: qwen3:8b
+temperature: 0
+seed: 42
+
+NEAR_DUPLICATE_THRESHOLD: 0.90
+REPEAT_COUNT: 3
+```
+
+`0.90`은 이번 진단에서 사용한 기준이며, 최적값이나 Production 최종값으로
+판단한 것은 아닙니다.
+
+기존 `EVAL_CASES`의 in-domain 6개와 out-of-domain 3개, 총 9개를 그대로
+사용했습니다. Case, 질문 또는 gold evidence를 새로 만들거나 변경하지 않았습니다.
+
+#### 실제 Retrieval과 Filter 결과
+
+| Case | Top-5 chunk_id | Filter 변경 | 제거 |
+| --- | --- | --- | --- |
+| copyright_in_domain | `[28, 39, 3, 93, 35]` | False | 없음 |
+| creative_contribution_copyright | `[28, 39, 30, 33, 31]` | False | 없음 |
+| ai_assignment_submission | `[69, 68, 76, 70, 75]` | True | rank 4, chunk 70 |
+| midjourney_contest_controversy | `[65, 74, 76, 53, 93]` | False | 없음 |
+| fake_news_damage_report | `[104, 99, 105, 7, 8]` | False | 없음 |
+| generative_ai_work_benefits | `[137, 13, 78, 138, 16]` | False | 없음 |
+| france_out_of_domain | `[136, 102, 65, 108, 96]` | False | 없음 |
+| solar_system_out_of_domain | `[146, 9, 36, 145, 155]` | False | 없음 |
+| triangle_out_of_domain | `[139, 74, 114, 75, 113]` | False | 없음 |
+
+9개 Case 모두 다음 입력 일관성 검사를 통과했습니다.
+
+```text
+HTTP context == rebuilt context: True
+```
+
+따라서 direct Generation 비교는 실제 API Retrieval 결과와 같은 Context를
+기준으로 수행했습니다.
+
+Filter가 아무 Source도 제거하지 않은 8개 Case에서는 Original과 Filtered의
+Context 및 Prompt가 완전히 같았습니다. 이때 Local LLM을 다시 호출하면 stochastic
+Generation 차이가 filter 효과처럼 보일 수 있으므로, Original 3회 run을 Filtered
+결과로 그대로 재사용했습니다.
+
+```text
+Original Context == Filtered Context
+Original Prompt == Filtered Prompt
+
+Original 3회 run
+→ Filtered 결과로 재사용
+```
+
+전체 9개 중 Context가 실제로 변경된 Case는 `ai_assignment_submission` 하나였습니다.
+
+```text
+removed rank: 4
+removed chunk_id: 70
+
+matched kept rank: 1
+matched kept chunk_id: 69
+
+overlap length: 100
+candidate length: 102
+coverage: 0.980392
+threshold: 0.90
+```
+
+이 Case의 gold evidence 상태는 다음과 같습니다.
+
+```text
+Original gold:
+[69, 68, 70]
+
+Filtered gold:
+[69, 68]
+```
+
+Chunk 70도 gold였지만 필터 후 다른 gold evidence가 유지됐습니다. 전체 평가에서
+모든 gold evidence가 제거된 Case는 0개였습니다. 이를 gold evidence 제거가
+일반적으로 안전하다는 의미로 일반화하지 않습니다.
+
+#### Retrieval 및 Filtering Summary
+
+```text
+Hit@5: 6/6
+MRR: 0.8750
+```
+
+이 Retrieval 지표는 Filter 전후 공통입니다. Near-duplicate filtering은 Retrieval
+결과를 바꾸지 않고 LLM에 전달하는 Context selection만 변경했으므로 Retrieval
+성능이나 Hit@5, MRR이 개선됐다고 표현하지 않습니다.
+
+```text
+Total cases: 9
+
+Filter changed Context: 1/9
+Filter unchanged: 8/9
+
+Sources before: 45
+Sources after: 44
+Sources dropped: 1
+
+모든 gold evidence가 제거된 Case: []
+```
+
+전체 45개 Retrieved Source 중 실제 Context filter가 제거한 Source는 하나였습니다.
+
+#### In-domain Generation 결과
+
+```text
+6 Cases × 3 Runs
+= 18 Runs
+
+Original undesired refusal: 3/18
+Filtered undesired refusal: 0/18
+
+Original citation present: 18/18
+Filtered citation present: 18/18
+
+Original citation valid: 18/18
+Filtered citation valid: 18/18
+```
+
+Refusal behavior 기준의 Case 분류는 다음과 같습니다.
+
+```text
+Improved:
+- ai_assignment_submission
+
+Regressed:
+- 없음
+
+Unchanged:
+- copyright_in_domain
+- creative_contribution_copyright
+- midjourney_contest_controversy
+- fake_news_damage_report
+- generative_ai_work_benefits
+```
+
+이 분류는 undesired refusal behavior만 기준으로 하며 전체 semantic correctness를
+뜻하지 않습니다.
+
+`ai_assignment_submission`에서는 전체 평가에서도 단일 Case 실험과 같은 방향의
+변화가 관찰됐습니다.
+
+```text
+Original undesired refusal: 3/3
+Filtered undesired refusal: 0/3
+```
+
+즉 near-duplicate Source를 Context에서 제외한 조건에서 undesired refusal이
+감소했습니다.
+
+#### Out-of-domain 결과
+
+```text
+3 Cases × 3 Runs
+= 9 Runs
+
+Original exact refusal: 9/9
+Filtered exact refusal: 9/9
+```
+
+`france_out_of_domain`, `solar_system_out_of_domain`,
+`triangle_out_of_domain`은 모두 Filter가 입력을 변경하지 않아 Original run을
+재사용했습니다. OOD regression은 관찰되지 않았습니다.
+
+#### Regression Check
+
+```text
+In-domain refusal regression: False
+OOD exact-refusal regression: False
+모든 gold evidence 제거: False
+Citation validity regression: False
+```
+
+이번 9개 Case에서는 near-duplicate filtering이 `ai_assignment_submission`의
+Generation refusal behavior를 개선했고, 다른 Evaluation Case에서 자동 지표상
+regression은 관찰되지 않았습니다. `Filter changed Context = 1/9`,
+`Sources dropped = 1/45`였으므로 이번 평가셋에서는 Context를 광범위하게 삭제하지
+않았습니다.
+
+그러나 `0.90`이 최적 threshold이거나 모든 PDF에서 안전하다고 판단할 수는
+없습니다. Near-duplicate filtering이 최종 해결책이거나 Production에 반드시
+적용해야 한다고도 아직 확정하지 않습니다. 현재 결과는 하나의 PDF와 9개
+Evaluation Case를 기준으로 한 소규모 평가입니다.
+
+또한 NO_ANSWER 여부와 Citation validity 같은 자동 지표만으로 실제 답변 내용의
+semantic correctness를 증명할 수는 없습니다. In-domain 답변에 대한 사람의 검토가
+계속 필요합니다.
+
+이번 단계로 `ai_assignment_submission`의 원인 진단은 종료합니다. 80자·60자
+overlap 비교, 특정 문장 삭제, token 단위 분석과 같은 더 작은 ablation은 추가하지
+않습니다.
+
+#### 다음 단계: Production Context Deduplication 적용 검토
+
+12-2E에서는 현재 diagnostic filter를 실제 FastAPI RAG 경로에 최소 변경으로
+적용할지 결정할 예정입니다. 적용한다면 Production Context selection 단계에
+near-duplicate 제거를 추가한 뒤 전체 API Evaluation을 다시 수행합니다.
+
+아직 12-2E는 수행하지 않았습니다. 이후에는 두 번째 실제 PDF를 사용해 다른
+문서에서도 document filtering과 near-duplicate Context selection이 정상적으로
+동작하는지 확인할 예정입니다.
 
 ## 진행 상황
 
@@ -5057,7 +5256,8 @@ near-duplicate Context filtering
 - [x] Duplicate Context Ablation
 - [x] Length-Matched Duplicate Control Ablation
 - [x] Near-Duplicate Context Filtering Experiment
-- [ ] Full Evaluation with Near-Duplicate Context Filtering
+- [x] Full Evaluation with Near-Duplicate Context Filtering
+- [ ] Production Context Deduplication 적용 검토
 
 ## AI 도구 활용
 
