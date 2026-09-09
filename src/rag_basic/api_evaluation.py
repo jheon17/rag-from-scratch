@@ -10,7 +10,7 @@ from rag_basic.chunking import PDF_PATH
 from rag_basic.evaluation import EVAL_CASES
 from rag_basic.local_llm import LOCAL_MODEL_NAME
 from rag_basic.local_rag import NO_ANSWER
-from rag_basic.retrieval import TOP_K
+from rag_basic.retrieval import TOP_K, build_context
 
 
 API_BASE_URL = os.getenv("RAG_API_BASE_URL", "http://127.0.0.1:8000")
@@ -57,6 +57,15 @@ def extract_citations(answer: str) -> list[int]:
     return list(dict.fromkeys(numbers))
 
 
+def extract_context_source_numbers(context: str) -> list[int]:
+    """Context header에서 Source 번호를 중복 없이 등장 순서대로 추출한다."""
+    numbers = [
+        int(number)
+        for number in re.findall(r"\[Source (\d+) \|", context)
+    ]
+    return list(dict.fromkeys(numbers))
+
+
 def evaluate_retrieval(
     results: list[dict], expected_chunk_ids: list[int]
 ) -> dict:
@@ -91,8 +100,21 @@ def evaluate_case(case: dict, status: int, body: dict) -> dict:
         }
 
     results = body.get("results", [])
+    context = body.get("context", "")
     answer = body.get("answer", "")
     citations = extract_citations(answer)
+    context_source_numbers = extract_context_source_numbers(context)
+    result_ranks = {result.get("rank") for result in results}
+    context_sources_valid = bool(context_source_numbers) and all(
+        source_number in result_ranks
+        for source_number in context_source_numbers
+    )
+    context_results = [
+        result
+        for result in results
+        if result.get("rank") in context_source_numbers
+    ]
+    context_rebuild_matches = build_context(context_results) == context
     basic = {
         "document_name_matches": body.get("document_name") == PDF_PATH.name,
         "query_matches": body.get("query") == case["query"],
@@ -100,7 +122,10 @@ def evaluate_case(case: dict, status: int, body: dict) -> dict:
         "result_count_matches": len(results) == TOP_K,
         "ranks_match": [result.get("rank") for result in results]
         == list(range(1, TOP_K + 1)),
-        "context_non_empty": bool(body.get("context")),
+        "context_non_empty": bool(context),
+        "context_source_numbers": context_source_numbers,
+        "context_sources_valid": context_sources_valid,
+        "context_rebuild_matches": context_rebuild_matches,
         "answer_non_empty": bool(answer),
         "llm_model_matches": body.get("llm_model") == LOCAL_MODEL_NAME,
     }
@@ -114,7 +139,8 @@ def evaluate_case(case: dict, status: int, body: dict) -> dict:
         "citations": citations,
         "citation_present": bool(citations),
         "citation_numbers_valid": bool(citations)
-        and all(1 <= number <= len(results) for number in citations),
+        and all(number in context_source_numbers for number in citations),
+        "contains_no_answer": NO_ANSWER in answer,
         "exact_refusal": answer == NO_ANSWER,
     }
     return {
@@ -129,12 +155,13 @@ def evaluate_case(case: dict, status: int, body: dict) -> dict:
 
 def print_cited_sources(results: list[dict], citations: list[int]) -> None:
     """Citation 번호에 대응하는 검색 결과 metadata와 text 일부를 출력한다."""
+    results_by_rank = {result["rank"]: result for result in results}
     for source_number in citations:
-        if not 1 <= source_number <= len(results):
+        if source_number not in results_by_rank:
             print(f"  Source {source_number}: Retrieval 결과 범위를 벗어남")
             continue
 
-        result = results[source_number - 1]
+        result = results_by_rank[source_number]
         preview = result["text"][:TEXT_PREVIEW_LENGTH].replace("\n", " ")
         print(
             f"  Source {source_number}: rank={result['rank']}, "
@@ -164,6 +191,18 @@ def print_case_result(evaluation: dict) -> None:
     chunk_ids = [result["chunk_id"] for result in results]
     print(f"Top-{TOP_K} chunk_id: {chunk_ids}")
     print(f"기본 Response 검증: {evaluation['basic']}")
+    print(
+        "Context Source 번호: "
+        f"{evaluation['basic']['context_source_numbers']}"
+    )
+    print(
+        "Context Source 번호 유효: "
+        f"{evaluation['basic']['context_sources_valid']}"
+    )
+    print(
+        "Context rebuild 일치: "
+        f"{evaluation['basic']['context_rebuild_matches']}"
+    )
 
     if case["type"] == "in_domain":
         retrieval = evaluation["retrieval"]
@@ -176,8 +215,12 @@ def print_case_result(evaluation: dict) -> None:
         print(f"Citation Source 번호: {generation['citations']}")
         print(f"Citation 존재: {generation['citation_present']}")
         print(
-            "Citation 번호 범위 유효: "
+            "Citation이 실제 Context Source에 유효: "
             f"{generation['citation_numbers_valid']}"
+        )
+        print(
+            "NO_ANSWER phrase 포함 여부: "
+            f"{generation['contains_no_answer']}"
         )
         print("Cited Source 연결:")
         print_cited_sources(results, generation["citations"])
@@ -222,6 +265,10 @@ def print_summary(evaluations: list[dict]) -> None:
         item["generation"]["exact_refusal"]
         for item in successful_out_of_domain
     )
+    undesired_refusal_count = sum(
+        item["generation"]["contains_no_answer"]
+        for item in successful_in_domain
+    )
 
     print("\n" + "=" * 88)
     print("Retrieval Summary")
@@ -241,6 +288,10 @@ def print_summary(evaluations: list[dict]) -> None:
         f"In-domain citation number valid: "
         f"{valid_citation_count}/{len(in_domain)}"
     )
+    print(
+        "In-domain undesired NO_ANSWER phrase count: "
+        f"{undesired_refusal_count}/{len(in_domain)}"
+    )
     print(f"OOD exact refusal: {refusal_count}/{len(out_of_domain)}")
 
     print("\n기존 Python baseline과 비교")
@@ -257,8 +308,8 @@ def print_summary(evaluations: list[dict]) -> None:
         "OOD 질문에도 Retrieval 결과가 존재할 수 있습니다."
     )
     print(
-        "Citation 검증은 표기 존재와 번호 범위만 확인하며, answer correctness나 "
-        "semantic/citation faithfulness 자동 평가가 아닙니다."
+        "Citation 검증은 표기 존재와 실제 Context Source 포함 여부만 확인하며, "
+        "answer correctness나 semantic/citation faithfulness 자동 평가가 아닙니다."
     )
 
 

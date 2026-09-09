@@ -5209,15 +5209,276 @@ semantic correctness를 증명할 수는 없습니다. In-domain 답변에 대�
 overlap 비교, 특정 문장 삭제, token 단위 분석과 같은 더 작은 ablation은 추가하지
 않습니다.
 
-#### 다음 단계: Production Context Deduplication 적용 검토
+### Production Context Deduplication 적용
 
-12-2E에서는 현재 diagnostic filter를 실제 FastAPI RAG 경로에 최소 변경으로
-적용할지 결정할 예정입니다. 적용한다면 Production Context selection 단계에
-near-duplicate 제거를 추가한 뒤 전체 API Evaluation을 다시 수행합니다.
+이전 전체 9개 regression evaluation에서는 다음 결과를 확인했습니다.
 
-아직 12-2E는 수행하지 않았습니다. 이후에는 두 번째 실제 PDF를 사용해 다른
-문서에서도 document filtering과 near-duplicate Context selection이 정상적으로
-동작하는지 확인할 예정입니다.
+```text
+Hit@5 = 6/6
+MRR = 0.8750
+
+Filter changed Context = 1/9
+Sources dropped = 1/45
+
+In-domain undesired refusal
+Original = 3/18
+Filtered = 0/18
+
+OOD exact refusal
+Original = 9/9
+Filtered = 9/9
+
+Citation validity regression = False
+```
+
+이를 바탕으로 12-2E에서는 검증한 diagnostic filter를 실제 FastAPI `/query`
+경로에 최소 변경으로 적용했습니다.
+
+#### Production 구조
+
+```text
+pgvector Retrieval Top-K
+        ↓
+원본 Retrieval results
+        ├─ API results로 그대로 반환
+        │
+        └─ Context selection
+              ↓
+        near-duplicate Source 제외
+              ↓
+        build_context()
+              ↓
+        Local LLM Generation
+```
+
+각 응답 필드의 역할은 다음과 같이 구분됩니다.
+
+```text
+results
+= 실제 pgvector Retrieval Top-K
+= Filtering하지 않음
+
+context
+= Retrieved Source 중
+  Generation에 실제 전달되는 Source를 선택한 결과
+```
+
+따라서 Context deduplication은 Retrieval 결과 자체를 변경하지 않습니다.
+
+새 Production 모듈 [context_selection.py](src/rag_basic/context_selection.py)를
+추가했습니다. 이 모듈은 FastAPI, PostgreSQL, Ollama, Evaluation에 직접 의존하지
+않는 순수 Context selection 로직입니다. Production `api.py`가 diagnostic
+experiment 모듈에 의존하지 않도록 실험 코드와 Production 코드를 분리했습니다.
+
+현재 적용한 기준은 다음과 같습니다.
+
+```text
+NEAR_DUPLICATE_COVERAGE_THRESHOLD = 0.90
+```
+
+상위 rank Source부터 우선 보존하고, 후순위 candidate에 대해 다음 조건을
+확인합니다.
+
+```text
+overlap length / candidate length >= 0.90
+```
+
+이미 선택된 Source와의 exact overlap coverage가 기준 이상이면 해당 candidate를
+Generation Context에서 제외합니다. Exact substring이면 coverage를 `1.0`으로
+처리합니다. `0.90`은 현재 regression evaluation에서 사용한 보수적인 기준이며
+최적 threshold를 의미하지 않습니다.
+
+순수 함수는 서비스 실행 전에 다음과 같이 별도로 검증했습니다.
+
+```text
+rank 보존: True
+input mutation 없음: True
+높은 coverage candidate 제거: True
+낮은 coverage candidate 보존: True
+threshold invalid -> ValueError: True
+```
+
+FastAPI `/query`의 Generation 경로는 다음처럼 변경됐습니다.
+
+```text
+이전:
+Retrieval results
+→ build_context(results)
+→ Generation
+
+현재:
+Retrieval results
+→ select_context_results(results)
+→ build_context(selected results)
+→ Generation
+```
+
+하지만 `QueryResponse.results`는 계속 원본 Retrieval 결과를 반환합니다.
+
+```text
+top_k
+= Retrieval Top-K
+
+results
+= 실제 Retrieval Top-K 전체
+
+context
+= Generation에 실제 사용된 selected Context
+```
+
+따라서 `top_k=5`, `results count=5`이면서 Context Source 수가 5보다 적을 수
+있습니다. Filtering 후에도 Source 번호를 다시 할당하지 않으므로 `[Source 1]`,
+`[Source 2]`, `[Source 3]`, `[Source 5]`처럼 비연속 번호가 존재할 수 있습니다.
+
+Production Context가 Retrieval results의 subset일 수 있게 됨에 따라
+`api_evaluation.py`도 다음 항목을 검증하도록 보완했습니다.
+
+- Context header에서 Source 번호 추출
+- Context Source가 실제 Retrieval result rank의 subset인지 확인
+- 해당 Source들로 `build_context()`를 다시 실행했을 때 API Context와 정확히 같은지 확인
+- Citation이 실제 Generation Context에 존재하는 Source를 가리키는지 확인
+
+기존처럼 Citation 번호가 단순히 1~Top-K 범위에 있는지만 보는 것이 아니라,
+실제로 LLM에게 제공된 Context에 해당 Source가 존재하는지 확인합니다.
+
+#### Assignment Production 검증
+
+다음 질문을 실제 Production `/query`에 3회 요청했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+```
+
+3회 모두 다음 결과가 확인됐습니다.
+
+```text
+HTTP status: 200
+
+results count: 5
+results chunk_ids: [69, 68, 76, 70, 75]
+
+Context Source: [1, 2, 3, 5]
+Source 4 header 없음: True
+
+NO_ANSWER 포함: False
+Exact NO_ANSWER: False
+
+Citation: [1]
+Citation context-valid: True
+```
+
+대표 답변은 다음과 같으며 3회 모두 동일했습니다.
+
+```text
+생성형 AI가 만든 결과물을 그대로 과제로 제출해도 되나요?
+그대로 제출해서는 안 됩니다. 생성형 AI를 활용해 과제의 아이디어를 얻거나 보고서 개요와 초안을 만들거나 번역, 사례 수집 등 보조적으로만 활용해야 하며, 최종 과제 보고서의 완성은 학습자 본인이 직접 해야 합니다. [Source 1]
+```
+
+이 결과를 향후 모든 실행에서 항상 같은 답변이 나온다는 의미로 일반화하지 않습니다.
+
+#### Production 적용 후 전체 API 평가
+
+| Case | Context Source |
+| --- | --- |
+| copyright_in_domain | `[1, 2, 3, 4, 5]` |
+| creative_contribution_copyright | `[1, 2, 3, 4, 5]` |
+| ai_assignment_submission | `[1, 2, 3, 5]` |
+| midjourney_contest_controversy | `[1, 2, 3, 4, 5]` |
+| fake_news_damage_report | `[1, 2, 3, 4, 5]` |
+| generative_ai_work_benefits | `[1, 2, 3, 4, 5]` |
+| france_out_of_domain | `[1, 2, 3, 4, 5]` |
+| solar_system_out_of_domain | `[1, 2, 3, 4, 5]` |
+| triangle_out_of_domain | `[1, 2, 3, 4, 5]` |
+
+모든 Case에서 다음 검증을 통과했습니다.
+
+```text
+Context Source 번호 유효: True
+Context rebuild 일치: True
+```
+
+Production 적용 후에도 Retrieval 지표는 유지됐습니다.
+
+```text
+Hit@5: 6/6
+MRR: 0.8750
+```
+
+이는 deduplication이 Retrieval 자체를 변경하지 않았음을 확인하는 regression
+check입니다.
+
+In-domain Generation 결과는 다음과 같습니다.
+
+```text
+In-domain answer non-empty: 6/6
+In-domain citation present: 6/6
+In-domain citation context-valid: 6/6
+In-domain undesired NO_ANSWER phrase: 0/6
+```
+
+Citation validity는 실제 Generation Context Source를 기준으로 검사했습니다.
+
+OOD 결과도 기존 동작을 유지했습니다.
+
+```text
+OOD exact refusal: 3/3
+```
+
+기존 HTTP validation contract도 유지됐습니다.
+
+```text
+/health → 200
+top_k=0 → 422
+query 누락 → 422
+존재하지 않는 document_name → 404
+```
+
+OpenAPI endpoint 구조도 유지됐습니다.
+
+```text
+OpenAPI JSON 정상: True
+/health 존재: True
+/query 존재: True
+/ingest 존재: True
+```
+
+현재 Evaluation PDF와 9개 Case 범위에서는 Production Context Deduplication 적용
+후 Retrieval metric을 유지하면서 이전에 관찰된 assignment Generation failure가
+개선됐고, 자동 구조 지표상 새로운 regression은 관찰되지 않았습니다.
+
+다만 이를 Production-ready 상태, 모든 문서에서 검증된 기능 또는 모든 RAG
+failure의 해결책이라고 표현하지 않습니다. `0.90`이 최적 threshold라고도 판단하지
+않습니다. NO_ANSWER 부재와 Citation context-valid만으로 semantic correctness나
+citation faithfulness 전체를 증명할 수 없으므로 사람의 답변 검토가 계속 필요합니다.
+
+이번 단계로 Production Context Deduplication 적용을 완료했습니다. 기존 단일
+assignment failure에 대한 추가 ablation은 더 진행하지 않습니다.
+
+#### 다음 단계: Second PDF Multi-Document Verification
+
+12-3에서는 기존 Evaluation PDF와 성격이 다른 두 번째 PDF를 실제 `/ingest`로
+추가한 뒤, PostgreSQL에 두 문서가 동시에 존재하는 상태에서 document filtering,
+Retrieval, Context selection, Generation이 서로 섞이지 않고 동작하는지 확인할
+예정입니다.
+
+확인할 항목은 다음과 같습니다.
+
+1. 두 번째 PDF `/ingest` 성공
+2. 기존 PDF row 유지
+3. 두 문서가 PostgreSQL에 동시에 존재
+4. 같은 질문에서도 `document_name`에 해당하는 문서 Chunk만 Retrieval
+5. 다른 문서의 Chunk가 결과에 섞이지 않음
+6. 두 번째 문서에서도 near-duplicate Context selection이 API 오류 없이 동작
+7. 두 문서 각각 실제 `/query` 검증
+
+아직 두 번째 PDF를 선택하거나 12-3을 실행하지 않았습니다. 이후의 큰 흐름은
+다음과 같습니다.
+
+```text
+Second PDF Multi-Document Verification
+→ FastAPI Dockerization
+→ Final README 정리
+```
 
 ## 진행 상황
 
@@ -5257,7 +5518,8 @@ near-duplicate 제거를 추가한 뒤 전체 API Evaluation을 다시 수행합
 - [x] Length-Matched Duplicate Control Ablation
 - [x] Near-Duplicate Context Filtering Experiment
 - [x] Full Evaluation with Near-Duplicate Context Filtering
-- [ ] Production Context Deduplication 적용 검토
+- [x] Production Context Deduplication 적용
+- [ ] Second PDF Multi-Document Verification
 
 ## AI 도구 활용
 

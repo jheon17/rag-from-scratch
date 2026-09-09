@@ -12,6 +12,7 @@ from pypdf.errors import PdfReadError
 from sentence_transformers import SentenceTransformer
 
 from rag_basic.chunking import CHUNK_OVERLAP, CHUNK_SIZE
+from rag_basic.context_selection import select_context_results
 from rag_basic.embedding import MODEL_NAME
 from rag_basic.local_llm import (
     LOCAL_MODEL_NAME,
@@ -55,13 +56,13 @@ class RetrievalResult(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    """검색 결과와 Context, Local LLM 답변의 응답 구조다."""
+    """원본 검색 결과와 선택된 Generation Context, Local LLM 답변 구조다."""
 
     document_name: str
     query: str
     top_k: int
-    results: list[RetrievalResult]
-    context: str
+    results: list[RetrievalResult]  # 원본 Retrieval Top-K
+    context: str  # Context selection 후 실제 Generation에 사용한 문자열
     answer: str
     llm_model: str
 
@@ -141,7 +142,8 @@ def query_retrieval(request: QueryRequest) -> QueryResponse:
             detail="Retrieval 서비스를 사용할 수 없습니다.",
         ) from None
 
-    context = build_context(results)
+    context_results = select_context_results(results)
+    context = build_context(context_results)
     prompt = build_local_rag_prompt(request.query, context)
     try:
         answer = generate_local_answer(prompt)
