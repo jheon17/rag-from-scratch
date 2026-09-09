@@ -5454,30 +5454,205 @@ citation faithfulness 전체를 증명할 수 없으므로 사람의 답변 검�
 이번 단계로 Production Context Deduplication 적용을 완료했습니다. 기존 단일
 assignment failure에 대한 추가 ablation은 더 진행하지 않습니다.
 
-#### 다음 단계: Second PDF Multi-Document Verification
+### Second PDF Multi-Document Verification
 
 12-3에서는 기존 Evaluation PDF와 성격이 다른 두 번째 PDF를 실제 `/ingest`로
-추가한 뒤, PostgreSQL에 두 문서가 동시에 존재하는 상태에서 document filtering,
-Retrieval, Context selection, Generation이 서로 섞이지 않고 동작하는지 확인할
-예정입니다.
-
-확인할 항목은 다음과 같습니다.
-
-1. 두 번째 PDF `/ingest` 성공
-2. 기존 PDF row 유지
-3. 두 문서가 PostgreSQL에 동시에 존재
-4. 같은 질문에서도 `document_name`에 해당하는 문서 Chunk만 Retrieval
-5. 다른 문서의 Chunk가 결과에 섞이지 않음
-6. 두 번째 문서에서도 near-duplicate Context selection이 API 오류 없이 동작
-7. 두 문서 각각 실제 `/query` 검증
-
-아직 두 번째 PDF를 선택하거나 12-3을 실행하지 않았습니다. 이후의 큰 흐름은
-다음과 같습니다.
+추가했습니다. PostgreSQL에 두 문서가 동시에 존재하는 상태에서 다음 경로가 문서
+간에 섞이지 않고 동작하는지 integration 수준에서 확인했습니다.
 
 ```text
-Second PDF Multi-Document Verification
-→ FastAPI Dockerization
+document_name filtering
+→ Retrieval
+→ Production Context Deduplication
+→ Generation
+```
+
+두 번째 문서는 NIST AI Risk Management Framework 1.0인
+`nist.ai.100-1.pdf`입니다. PDF 원본은 Git repository에 포함하지 않고 로컬 ingest
+fixture로만 사용했습니다.
+
+#### PDF 및 실행 환경 검증
+
+PDF와 DB 환경은 다음과 같이 확인했습니다.
+
+```text
+PDF exists: True
+size > 0: True
+PDF magic: True
+
+POSTGRES_DB set: True
+POSTGRES_USER set: True
+POSTGRES_PASSWORD set: True
+
+get_database_config success: True
+host: 127.0.0.1
+port: 5432
+```
+
+환경변수의 secret 값 자체는 출력하거나 기록하지 않았습니다.
+
+#### `/ingest` 결과
+
+두 번째 PDF의 실제 적재 결과는 다음과 같습니다.
+
+```text
+HTTP status: 200
+document_name: nist.ai.100-1.pdf
+chunk_count: 275
+embedding_dimension: 384
+embedding_model: intfloat/multilingual-e5-small
+chunk_size: 500
+chunk_overlap: 100
+```
+
+적재 전후의 문서별 행 수는 다음과 같습니다.
+
+```text
+기존 document rows before: 162
+기존 document rows after: 162
+NIST rows before: 0
+NIST rows after: 275
+
+Original document row count: 162
+Second document row count: 275
+Both documents coexist in PostgreSQL: True
+```
+
+두 번째 문서를 적재한 뒤에도 기존 문서의 162개 행이 그대로 유지됐습니다.
+
+#### 네 가지 Query 설계와 결과
+
+동일한 질문을 서로 다른 `document_name`에 보내 검색 범위가 문서별로 분리되는지
+확인했습니다.
+
+- A: NIST 문서에 `AI RMF Core를 구성하는 네 가지 기능은 무엇인가요?` 질문
+- B: 기존 Evaluation PDF에 동일한 NIST 질문
+- C: 기존 Evaluation PDF에 기존 `ai_assignment_submission` 질문
+- D: NIST 문서에 동일한 `ai_assignment_submission` 질문
+
+| Query | Document | Top-5 chunk_id | Context Source | Generation |
+| --- | --- | --- | --- | --- |
+| A | NIST | `[137, 139, 272, 271, 30]` | `[1, 2, 3, 4, 5]` | 정상 답변 |
+| B | 기존 문서 | `[13, 138, 20, 56, 125]` | `[1, 2, 3, 4, 5]` | exact refusal |
+| C | 기존 문서 | `[69, 68, 76, 70, 75]` | `[1, 2, 3, 5]` | 정상 답변 |
+| D | NIST | `[34, 4, 175, 24, 16]` | `[1, 2, 3, 4, 5]` | exact refusal |
+
+NIST 문서에 NIST 질문을 보냈을 때 실제 답변은 다음과 같았습니다.
+
+```text
+AI RMF Core를 구성하는 네 가지 기능은 GOVERN, MAP, MEASURE, MANAGE입니다. [Source 1]
+```
+
+현재 Retrieval Context에서 문서 근거를 찾아 생성한 답변입니다. 다만 이 단일
+답변만으로 일반적인 semantic correctness를 증명한 것은 아닙니다.
+
+동일한 NIST 질문을 기존 PDF에 보냈을 때는 다음과 같이 exact refusal했습니다.
+
+```text
+제공된 문서에서 확인할 수 없습니다.
+```
+
+기존 assignment 질문은 기존 PDF에서 정상 답변을 생성했고 NIST PDF에서는 exact
+refusal했습니다. 두 쌍의 검색 본문 비교 결과도 다음과 같이 서로 달랐습니다.
+
+```text
+A vs B result texts identical: False
+C vs D result texts identical: False
+```
+
+#### DB membership 기반 document isolation
+
+Retrieval 결과가 요청 문서에 속하는지는 단순히 `chunk_id` 숫자만으로 판단하지
+않았습니다. 문서마다 동일한 Chunk ID가 존재할 수 있으므로 PostgreSQL에서 다음
+조합과 일치하는 실제 행이 있는지 검사했습니다.
+
+```text
+document_name
++ chunk_id
++ content
+```
+
+검증 결과는 다음과 같습니다.
+
+```text
+All retrieval results scoped to requested document: True
+Cross-document contamination detected: False
+Same query is scoped independently by document_name: True
+```
+
+따라서 동일한 Query라도 `document_name`이 다르면 지정한 문서 범위 안에서만 Vector
+Search가 수행되는 것을 두 문서 환경에서 확인했습니다.
+
+#### Context 및 기존 기능 회귀 검증
+
+A/B/C/D 모든 Query에서 Context Source 번호가 Retrieval result rank의 subset인지
+검사했습니다. 선택된 Source만 `build_context()`에 다시 전달해 만든 문자열이 API
+응답의 Context와 정확히 같은지도 확인했습니다.
+
+```text
+All Context rebuild checks passed: True
+```
+
+NIST 질문에서는 제거할 near-duplicate가 없어 Retrieval Source 5개가 Context에도
+모두 유지됐습니다.
+
+```text
+Retrieval Source count: 5
+Context Source count: 5
+```
+
+두 번째 PDF에서도 Production Context selection이 API 오류 없이 동작했습니다.
+Source가 제거되지 않은 것은 오류가 아니며, 모든 문서에서 반드시 Source가 제거돼야
+한다는 의미도 아닙니다.
+
+두 번째 PDF 적재 후 기존 assignment Case의 Production Context Deduplication도
+다음과 같이 유지됐습니다.
+
+```text
+results chunk_ids: [69, 68, 76, 70, 75]
+Context Source: [1, 2, 3, 5]
+NO_ANSWER phrase 포함: False
+Citation context-valid: True
+Existing assignment regression passed: True
+```
+
+#### 최종 Multi-Document Summary
+
+```text
+Original document row count: 162
+Second document row count: 275
+Both documents coexist in PostgreSQL: True
+All four queries HTTP 200: True
+All retrieval results scoped to requested document: True
+Cross-document contamination detected: False
+All Context rebuild checks passed: True
+Existing assignment regression passed: True
+```
+
+이번 결과는 서로 다른 두 실제 PDF가 PostgreSQL에 동시에 존재할 때
+`document_name` 기반 Retrieval isolation, Production Context selection, Local LLM
+Generation 경로가 문서 간 혼입 없이 동작하는지 확인한 integration verification입니다.
+
+모든 PDF 지원, Production-ready 상태, 모든 언어 지원, semantic correctness의 완전한
+검증 또는 `0.90` threshold의 최적성을 의미하지 않습니다. 이번 단계의 검증 범위는
+두 실제 PDF로 제한됩니다.
+
+#### 다음 단계: 13. FastAPI Dockerization
+
+다음 단계에서는 현재 host에서 직접 실행 중인 FastAPI 서비스를 Docker image와
+container로 실행할 수 있게 구성합니다. 기존 Docker PostgreSQL과 연결해 `/health`,
+`/query`, `/ingest`가 컨테이너 환경에서도 동작하는지 검증할 예정입니다.
+
+Ollama는 우선 host에서 계속 실행합니다. 이번 프로젝트에서는 GPU container나 Ollama
+container까지 확장하기보다 FastAPI와 PostgreSQL의 서비스 경계를 검증하는 데
+집중합니다.
+
+이후의 큰 흐름은 다음과 같습니다.
+
+```text
+FastAPI Dockerization
 → Final README 정리
+→ 프로젝트 마무리
 ```
 
 ## 진행 상황
@@ -5519,7 +5694,9 @@ Second PDF Multi-Document Verification
 - [x] Near-Duplicate Context Filtering Experiment
 - [x] Full Evaluation with Near-Duplicate Context Filtering
 - [x] Production Context Deduplication 적용
-- [ ] Second PDF Multi-Document Verification
+- [x] Second PDF Multi-Document Verification
+- [ ] FastAPI Dockerization
+- [ ] Final README 정리
 
 ## AI 도구 활용
 
